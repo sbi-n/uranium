@@ -15,6 +15,7 @@ add_executable(uranium main.cpp
         src/decompiler/ast.cpp
         src/decompiler/decompiler.cpp
         src/disassembler/disassembler.cpp
+        src/decompiler/ir.h
 )
 
 add_subdirectory(extern/luau)
@@ -27,6 +28,7 @@ target_link_libraries(uranium
         Luau.Config
         Luau.CodeGen
         Luau.VM
+        Luau.VM.Internals
         Luau.Require
         Luau.Bytecode
 )

@@ -9,10 +9,27 @@
 #include "Luau/Bytecode.h"
 #include "Luau/BytecodeUtils.h"
 #include "Luau/BytecodeDump.h"
+#include "src/decompiler/ir.h"
 
-int main() {
+int main()
+{
     const char *source = R"(
     print("HELLO")
+
+    local function hello()
+        local function world()
+            print("World")
+        end
+
+        local function shit()
+        end
+
+        return world
+    end
+
+    local function greet()
+        print("Nice to meet you")
+    end
 
     return 1, 2, 3
     )";
@@ -26,40 +43,8 @@ int main() {
 
     size_t size;
     char *bytecode = luau_compile(source, strlen(source), nullptr, &size);
-    int result = luau_load(T, "=stdin", bytecode, size, 0);
 
-    if (result != 0) {
-        std::cerr << lua_tostring(T, -1) << std::endl;
-        return 0;
-    };
-
-    TValue *value = T->top - 1;
-    Closure *closure = clvalue(value);
-
-    if (closure->isC) {
-        std::cerr << "Unexpected behavior ( tried to disassemble c closure. )" << std::endl;
-        return 0;
-    }
-
-    Proto *proto = closure->l.p;
-
-    std::cout << "debugname: " << (proto->debugname ? getstr(proto->debugname) : "??") << std::endl;
-    std::cout << "sizecode: " << proto->sizecode << '\n';
-
-    for (int pc = 0; pc < proto->sizecode;) {
-        Instruction insn = proto->code[pc];
-        uint8_t op = LUAU_INSN_OP(insn);
-        auto opcode = static_cast<LuauOpcode>(op);
-
-        // Luau::Bytecode::getLuauOpcodeName(opcode)
-        std::cout
-                << luaG_getline(proto, pc)
-                << ": "
-                << Luau::Bytecode::getLuauOpcodeName(opcode)
-                << '\n';
-
-        pc += Luau::getOpLength(opcode);
-    }
+    lift(bytecode, size);
 
     lua_close(L);
 }
