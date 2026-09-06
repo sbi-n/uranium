@@ -1,17 +1,20 @@
 #include <iostream>
 #include <vector>
+#include <map>
 
 #include "Luau/Compiler.h"
 #include "Luau/Bytecode.h"
 #include "Luau/BytecodeUtils.h"
 #include "Luau/BytecodeDump.h"
+#include "Luau/BytecodeUtils.h"
 #include "ldebug.h"
 #include "lstate.h"
 #include "lua.h"
 #include "lualib.h"
 #include "luacode.h"
+#include "ir.h"
 
-int lift(char *bytecode, int size)
+IRContext *lift(char *bytecode, int size)
 {
 
     lua_State *L = luaL_newstate();
@@ -26,7 +29,6 @@ int lift(char *bytecode, int size)
     if (result != 0)
     {
         std::cerr << lua_tostring(T, -1) << std::endl;
-        return 0;
     };
 
     TValue *value = T->top - 1;
@@ -35,7 +37,6 @@ int lift(char *bytecode, int size)
     if (closure->isC)
     {
         std::cerr << "Unexpected behavior ( tried to disassemble c closure. )" << std::endl;
-        return 0;
     }
 
     Proto *proto = closure->l.p;
@@ -58,6 +59,7 @@ int lift(char *bytecode, int size)
         }
     }
 
+    /*
     int steps = 0;
     while (!protos.empty())
     {
@@ -86,6 +88,44 @@ int lift(char *bytecode, int size)
             pc += Luau::getOpLength(opcode);
         }
     }
+    */
+
+    IRContext context;
+    for (Proto *p : protos)
+    {
+        IRFunction function;
+        function.debugname = p->debugname ? getstr(p->debugname) : nullptr;
+
+        std::map<uint32_t, IRBlock> blocksMap;
+        int lastStartPc = 0;
+        for (int pc = 0; pc < p->sizecode;)
+        {
+            Instruction insn = p->code[pc];
+            uint8_t op = LUAU_INSN_OP(insn);
+            auto opcode = static_cast<LuauOpcode>(op);
+
+            int jumpTarget = Luau::getJumpTarget(insn, pc);
+
+            if (jumpTarget != -1)
+            {
+                IRBlock block;
+
+                function.blocks.push_back(block);
+
+                lastStartPc = pc;
+            }
+
+            pc += Luau::getOpLength(opcode);
+        }
+
+        context.functions.push_back(function);
+    }
 
     lua_close(L);
+
+    return nullptr;
+}
+
+std::string dump(IRContext *context)
+{
 }

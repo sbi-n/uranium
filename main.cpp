@@ -10,6 +10,7 @@
 #include "Luau/BytecodeUtils.h"
 #include "Luau/BytecodeDump.h"
 #include "src/decompiler/ir.h"
+#include "src/decompiler/decompiler.h"
 
 int main()
 {
@@ -44,7 +45,7 @@ int main()
     size_t size;
     char *bytecode = luau_compile(source, strlen(source), nullptr, &size);
 
-    lift(bytecode, size);
+    decompile(bytecode, size);
 
     lua_close(L);
 }
