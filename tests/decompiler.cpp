@@ -134,6 +134,14 @@ const Case cases[] = {
     {"mutable phi capture", R"(local x=1 local function f() return x end if unknown then x=9 else x=7 end return f(),x)"},
     {"multiple closures", R"(local x=0 local function inc() x+=1 end local function get() return x end inc() inc() return get())"},
     {"table open call", R"(local function f() return 3,nil,5 end local t={1,2,f()} return t[1],t[2],t[3],t[4],t[5])"},
+    {"table callback open tail", R"(local log=''
+        local function connect(callback) local value=callback() log..=value return value,nil,5 end
+        local t={connect(function() return 'a' end),connect(function() return 'b' end)}
+        return t[1],t[2],t[3],t[4],t[5],log)"},
+    {"table callback capture timing", R"(local x=1
+        local function connect(callback) local value=callback() x+=1 return value,nil,x end
+        local t={connect(function() return x end),connect(function() return x end)}
+        return t[1],t[2],t[3],t[4],x)"},
     {"table value timing", R"(local x=1 local function change() x=9 return 2 end local t={a=x,b=change()} return t.a,t.b,x)"},
     {"metamethod timing", R"(local log='' local mt={__index=function(t,k) log..=k return 3 end}
         local t=setmetatable({},mt) local a=t.a local b=t.b return b,a,log)"},

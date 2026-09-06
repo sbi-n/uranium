@@ -27,7 +27,7 @@ Build
 ```bash
 cmake -S . -B build -DBUILD_TESTING=ON
 cmake --build build --target uranium ir_tests decompiler_tests -j 4
-./build/uranium
+./build/uranium --help
 ctest --test-dir build --output-on-failure
 ```
 
@@ -86,9 +86,16 @@ std::string source = decompile(bytecode);
 Link against `uranium_decompiler`. The API returns source rather than writing to stdout;
 loading and reconstruction failures throw `std::runtime_error`.
 
+The CLI requires an input file or `-` for standard input. By default it reads compiled
+Luau bytecode and writes decompiled source to standard output. Use `--source` to compile
+Luau source before decompiling, or `--ir` to print the lifted IR instead.
+
 ```bash
+./build/uranium --help
 ./build/uranium compiled.bytecode
+./build/uranium compiled.bytecode > recovered.luau
 ./build/uranium --source example.luau
+./build/uranium --ir compiled.bytecode
 ./build/uranium --source --ir example.luau
 ./build/uranium --source - < example.luau
 ```

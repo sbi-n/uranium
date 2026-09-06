@@ -800,8 +800,8 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
                 bool conflict = directUses(s, id) != 0;
                 for (const auto& lhs : s.lhs)
                     conflict |= lhs->kind != EK::SYMBOL || lhs->symbol == id || dependencies.count(lhs->symbol);
-                // A closure can observe the table through an outer reference.
-                for (auto& rhs : s.rhs) if (rhs->kind == EK::FUNCTION) conflict = true;
+                // Captured tables are excluded above. Creating an unrelated
+                // callback does not expose this table or execute the callback.
                 for (auto dependency : dependencies)
                     if (ast.symbols[dependency].captured)
                         for (auto& rhs : s.rhs)
