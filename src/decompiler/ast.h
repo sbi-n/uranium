@@ -17,6 +17,7 @@ struct ASTSymbol
     bool parameter = false;
     bool loopVariable = false;
     bool captured = false;
+    std::optional<std::string> debugname;
 };
 
 struct ASTTableField { ASTExpr key; ASTExpr value; }; // A null key is a list field.
@@ -31,6 +32,7 @@ struct ASTExpression
     std::vector<ASTTableField> fields;
     std::shared_ptr<ASTFunction> function;
     bool multret = false;
+    bool argumentsBeforeCallee = false; // CALL: retain the fast-call evaluation order.
 };
 
 struct ASTStatement

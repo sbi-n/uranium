@@ -21,7 +21,7 @@ namespace
 {
 void check(bool value, const std::string& message) { if (!value) throw std::runtime_error(message); }
 
-std::string evaluate(const std::string& source)
+std::string evaluate(const std::string& source, const Luau::CompileOptions& options = {})
 {
     std::unique_ptr<lua_State, decltype(&lua_close)> state(luaL_newstate(), lua_close);
     auto L = state.get();
@@ -31,7 +31,7 @@ std::string evaluate(const std::string& source)
     lua_callbacks(L)->interrupt = [](lua_State* L, int gc) {
         if (gc < 0 && ++*static_cast<unsigned*>(lua_callbacks(L)->userdata) > 10000) luaL_error(L, "test execution budget exceeded");
     };
-    auto bytecode = Luau::compile(source);
+    auto bytecode = Luau::compile(source, options);
     if (luau_load(L, "=test", bytecode.data(), bytecode.size(), 0) || lua_pcall(L, 0, LUA_MULTRET, 0))
         throw std::runtime_error(lua_tostring(L, -1));
     std::ostringstream out;
@@ -143,11 +143,104 @@ const Case cases[] = {
         local t={connect(function() return x end),connect(function() return x end)}
         return t[1],t[2],t[3],t[4],x)"},
     {"table value timing", R"(local x=1 local function change() x=9 return 2 end local t={a=x,b=change()} return t.a,t.b,x)"},
+    {"table store operands", R"(local log=''
+        local input=setmetatable({}, {__index=function(t,k) log..=k return k=='key' and 'answer' or 7 end})
+        local target=setmetatable({}, {__newindex=function(t,k,v) log..='store' rawset(t,k,v) end})
+        local key=input.key local value=input.value target[key]=value
+        local amount=math.abs(-2) target.amount=amount return target.answer,target.amount,log)"},
+    {"table store snapshots", R"(local t={} local original=t local key=1
+        local function change() t={} key=2 return 9 end
+        t[key]=change() return original[1],original[2],t[1],t[2],key)"},
+    {"parameter snapshot before reassignment", R"(local function test(n,c)
+        local old=n if c then n=7 end return old,n end
+        return test(3,true),test(4,false))"},
+    {"call arguments before parameter reassignment", R"(local function test(a,c)
+        local b=a.aass local result=select(2,a,a.aass)
+        if c then a={} end return result,a.aass end
+        return test({aass=7},false),test({aass=9},true))"},
+    {"loop argument aliases", R"(local result=0
+        for i=1,3 do local copy=i math.abs(i) result+=select(1,copy) end return result)"},
+    {"loop alias snapshot before write", R"(local result=0
+        for i=1,3 do local copy=i i=99 result+=select(1,copy) end return result)"},
+    {"immutable captured argument aliases", R"(local a={aass=7}
+        local function reader() return a end
+        local copy=a math.abs(-2) return select(2,reader(),copy.aass))"},
+    {"argument snapshot across mutation", R"(local a={aass=5}
+        local function mutate() a={aass=9} return 2 end
+        local function consume(first,second,third) return first.aass,second,third end
+        return consume(a,mutate(),a.aass))"},
+    {"property before callee lookup", R"(consume=function(a,b) return 'old',b end
+        local a=setmetatable({}, {__index=function()
+            consume=function(a,b) return 'new',b end return 7 end})
+        local b=a.aass return consume(a,b))"},
+    {"property after callee lookup", R"(consume=function(a,b) return 'old',b end
+        local a=setmetatable({}, {__index=function()
+            consume=function(a,b) return 'new',b end return 7 end})
+        return consume(a,a.aass))"},
+    {"single use in branch and loop", R"(local function test(n,c)
+        local old=n local suffix='x' local result=''
+        for i=1,3 do result..=suffix end
+        if c then return old,result end return 0,result end
+        return test(3,true),test(4,false))"},
+    {"callee across closure declaration", R"(local call=pcall
+        local function callback() return 17 end
+        return call(callback))"},
+    {"pcall callback arguments and results", R"(local n=1
+        local function callback(a,...) n+=a return n,... end
+        local ok,a,b,c=pcall(callback,2,'tail',nil) return ok,a,b,c,n)"},
+    {"pcall callback error", R"(local ok,message=pcall(function() error('callback failed',0) end)
+        return ok,message)"},
+    {"spawn nested callbacks", R"(task={spawn=function(callback,...) return callback(...) end}
+        local n=3 local function callback(a)
+            local ok,value=pcall(function() n+=a return n end) return ok,value
+        end return task.spawn(callback,4))"},
+    {"callback capture timing", R"(local n=1
+        local function callback() return n end
+        local function change() n=9 end change() return pcall(callback))"},
+    {"callback value snapshot", R"(local function test(n,c)
+        local snapshot=n local function callback() return snapshot end
+        if c then n=9 end return pcall(callback),n end return test(3,true),test(4,false))"},
+    {"shared callback", R"(local n=0 local function callback() n+=1 return n end
+        local ok,a=pcall(callback) local ok2,b=pcall(callback) return ok,a,ok2,b,n)"},
+    {"recursive callback", R"(local function callback(n)
+        if n<=1 then return 1 end return n*callback(n-1) end return pcall(callback,5))"},
+    {"callback identity across loop", R"(task={spawn=function(callback)
+        if previous then return previous==callback end previous=callback return true end}
+        local n=0 local function callback() return n end local same=true
+        for i=1,3 do n=i same=task.spawn(callback) and same end return same)"},
+    {"nested builtin table store", R"(local log='' local data={}
+        local function read(label,value) log..=label return value end
+        local t=setmetatable({}, {__newindex=function(_,key,value) log..='store' data[key]=value end})
+        t[read('key','value')]=math.clamp(math.round(read('value',12.6)),0,255)
+        t.text=tostring(math.round(read('text',0.42)*100))..'%'
+        return data.value,data.text,log)"},
+    {"builtin argument packs", R"(local function values() return -3,8,2 end
+        local function selectTail(...) return select(2,...) end
+        return math.max(values()),selectTail(1,nil,3))"},
+    {"stored function captures", R"(local value=1 local t={}
+        local function callback(n) value+=n return value end
+        t.callback=callback value=5 return t.callback(2),t.callback(3),value)"},
+    {"stored function snapshot", R"(local function test(value)
+        local snapshot=value local t={callback=function() return snapshot end}
+        value=9 return t.callback(),value end return test(3))"},
+    {"stored shared and recursive functions", R"(local t={}
+        local function callback(n) if n<=1 then return 1 end return n*callback(n-1) end
+        t.first=callback t.second=callback return t.first==t.second,t.first(5))"},
+    {"stored function loop identity", R"(local value=1 local function callback() return value end
+        local t={} for i=1,3 do t[i]=callback value=i end
+        return t[1]==t[2],t[2]==t[3],t[1]())"},
     {"metamethod timing", R"(local log='' local mt={__index=function(t,k) log..=k return 3 end}
         local t=setmetatable({},mt) local a=t.a local b=t.b return b,a,log)"},
     {"comparison NaN", R"(local function f(a,b) return not(a<=b),not(a<b),a==b end return f(0/0,3))"},
     {"false if expression", R"(local function f(c) local x=if c then false else 4 return x end return f(true),f(false))"},
     {"global generated names", R"(v_0=7 uv_0=8 f_0=9 local x=v_0 local y=uv_0 local function f() return f_0 end return x,y,f())"},
+    {"duplicate function debugnames", R"(local function same() return 1 end local first=same
+        local function same() return first()+2 end return first(),same())"},
+    {"nested function debugnames", R"(local function same(n)
+        local function same(x) return n+x end return same(3) end return same(4))"},
+    {"generated function debugnames", R"(local function v_0(value) return value+1 end
+        local function uv_0() return v_0(3) end local function f_0() return uv_0() end return f_0())"},
+    {"environment function debugname", R"(local function getfenv() return 4 end v_0=7 return getfenv(),v_0)"},
     {"multiple assignment swap", R"(local a=3 local b=7 local n=0 while n<5 do a,b=b,a n+=1 end return a,b)"},
     {"table capture and open tail", R"(local x=1 local function change() x=9 return 2,nil,4 end local t={a=x,change()} return t.a,t[1],t[2],t[3],x)"},
     {"table evaluation order", R"(local log='' local function f(x) log..=x return x end
@@ -218,6 +311,120 @@ void roundTrips()
     check(!failed, "decompiler round-trip failures");
 }
 
+void branchRecovery()
+{
+    const Case branches[] = {
+        {"short circuit shared arms", R"(
+            if a and b and not c then mark('branch_body_marker')
+            else mark('alternative_marker') end
+            mark('shared_tail_marker'))"},
+        {"nested early return continuation", R"(
+            if a then
+                if b then return end
+                mark('branch_body_marker')
+            end
+            mark('shared_tail_marker'))"},
+        {"returning elseif arms", R"(
+            if a then
+                if b then return end
+                mark('branch_body_marker')
+            elseif b then
+                if c then return end
+                mark('alternative_marker')
+            else return end
+            mark('shared_tail_marker'))"},
+        {"mixed short circuit", R"(
+            if (a or b) and c then mark('branch_body_marker')
+            else mark('alternative_marker') end
+            mark('shared_tail_marker'))"},
+        {"nested opposite conditions", R"(
+            local t = setmetatable({}, {__index=function(_, key)
+                mark(key)
+                if key == 'left' then return b else return c end
+            end})
+            if not a or not (t.left or t.right) then mark('branch_body_marker') end
+            mark('shared_tail_marker'))"},
+        {"shared loop continuation", R"(
+            for i=1,4 do
+                if a then
+                    if b then continue end
+                    mark('branch_body_marker')
+                end
+                if c and i==2 then break end
+                mark('shared_tail_marker')
+            end)"},
+        {"guarded shared closure", R"(
+            if a then
+                if b then return end
+                mark('branch_body_marker')
+            end
+            local value=c
+            local function callback() mark('shared_tail_marker') return value end
+            value=b
+            mark(tostring(callback())))"},
+        {"short circuit side effects", R"(
+            local function hit(key, value) mark(key) return value end
+            if (hit('a', a) or hit('b', b)) and hit('c', c) then
+                mark('branch_body_marker')
+            else mark('alternative_marker') end
+            mark('shared_tail_marker'))"},
+        {"condition mutation timing", R"(
+            local function hit() a=not a mark('hit') return b end
+            if a and hit() then mark('branch_body_marker') end
+            mark(tostring(a))
+            mark('shared_tail_marker'))"},
+        {"shared nil materialization", R"(
+            local value = a or (not b and tostring(c or 'default')) or nil
+            mark(tostring(value))
+            mark('shared_tail_marker'))"},
+    };
+    for (const auto& test : branches)
+    {
+        std::string source = "local log='' local function mark(s) log..=s..':' end local function test(a,b,c) ";
+        source += test.source;
+        std::string definition = source + " end return test";
+        source += R"( end
+            local values={false,true,0,''}
+            for i=1,5 do for j=1,5 do for k=1,5 do
+                test(values[i],values[j],values[k]) mark('|')
+            end end end return log)";
+        auto expected = evaluate(source);
+        for (int optimization : {0, 1, 2})
+            for (int debug : {0, 2})
+            {
+                Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+                auto output = decompile(Luau::compile(source, options));
+                std::string context = std::string(test.name) + " (opt=" + std::to_string(optimization) +
+                    ", debug=" + std::to_string(debug) + ")";
+                check(evaluate(output) == expected, context + ": branch effects/results changed\n" + output);
+                // Returning the function prevents optimization level 2 from
+                // also inlining a legitimate second copy into the test driver.
+                auto bytecode = Luau::compile(definition, options);
+                auto structure = decompile(bytecode);
+                auto cfg = buildCFG(lift(bytecode));
+                for (const char* marker : {"branch_body_marker", "alternative_marker", "shared_tail_marker"})
+                {
+                    if (source.find(marker) == std::string::npos) continue;
+                    // Nested callbacks can still be inlined by the compiler.
+                    // Count its reachable copies, so only decompiler duplication
+                    // (or loss) fails this assertion.
+                    size_t expectedCopies = 0, actualCopies = 0;
+                    for (size_t f = 0; f < cfg.ir.functions.size(); ++f)
+                        for (const auto& block : cfg.ir.functions[f].blocks)
+                            if (cfg.functions[f].blocks[block.id].reachable)
+                                for (const auto& instruction : block.instructions)
+                                    for (const auto& operand : instruction.operands)
+                                        if (auto text = std::get_if<IRConstantString>(&operand); text && text->value == marker)
+                                            ++expectedCopies;
+                    for (size_t pos = structure.find(marker); pos != std::string::npos; pos = structure.find(marker, pos + 1))
+                        ++actualCopies;
+                    check(expectedCopies > 0 && actualCopies == expectedCopies,
+                        context + ": missing or duplicated branch body " + marker + "\n" + structure);
+                }
+            }
+    }
+}
+
 void stagesAndNames()
 {
     Luau::CompileOptions options; options.optimizationLevel = 0; options.debugLevel = 0;
@@ -251,6 +458,161 @@ void stagesAndNames()
         previous = position;
     }
 }
+
+void argumentAliases()
+{
+    for (int optimization : {0, 1, 2})
+        for (int debug : {0, 2})
+        {
+            Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+            auto simple = decompile(Luau::compile("local a=input local b=a.aass print(a)", options));
+            check(simple.find("print(v_0)") != std::string::npos, "plain arguments should reuse the original binding");
+
+            auto parameter = decompile(Luau::compile(R"(local function test(a)
+                local b=a.aass print(a) print(a,a.aass)
+                if input then a={} end return a end return test)", options));
+            check(parameter.find("print(v_0)") != std::string::npos, "later parameter assignments must not force an argument copy:\n" + parameter);
+            check(parameter.find("print(v_0, v_0.aass)") != std::string::npos, "property arguments should inline beside their original receiver:\n" + parameter);
+
+            auto loop = decompile(Luau::compile("for a in values do local b=a.aass print(a,a.aass) end", options));
+            check(loop.find("print(v_0, v_0.aass)") != std::string::npos, "loop argument copies should disappear:\n" + loop);
+
+            auto captured = decompile(Luau::compile(R"(local a=input local function reader() return a end
+                local b=a.aass local copy=a print(copy) return reader)", options));
+            check(captured.find("print(uv_0)") != std::string::npos, "read-only captures should not need argument snapshots:\n" + captured);
+        }
+}
+
+void singleUseCallAndStoreValues()
+{
+    for (int optimization : {0, 1, 2})
+        for (int debug : {0, 2})
+        {
+            Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+            for (const char* source : {
+                "print(math.abs(input))",
+                "return math.clamp(math.round(input), 0, 255)",
+                "target.child.value = math.abs(input)",
+                "target[readKey()] = math.clamp(math.round(input), 0, 255)",
+                "target:consume(math.abs(input), tonumber(text))",
+                "target.Text = tostring(math.round(input * 100)) .. '%'",
+                "target.value = function() return 1 end",
+                "local function callback() return 1 end target.value = callback",
+                "return {callback = function() return 1 end}",
+            })
+            {
+                auto output = decompile(Luau::compile(source, options));
+                check(output.find("local ") == std::string::npos,
+                    "single-use call and table operands should inline (opt=" + std::to_string(optimization) + "):\n" + output);
+            }
+
+            // Unsafe environments exercise the fallback lookup order, including
+            // open arguments that are represented as nested calls in the AST.
+            for (const char* source : {
+                R"(local env=getfenv() local log=''
+                    env.math={abs=function(n) log..='old' return n+1 end}
+                    local value=setmetatable({}, {__index=function()
+                        log..='arg' env.math.abs=function(n) log..='new' return n+10 end return 3 end})
+                    local result=math.abs(value.input) return result,log)",
+                R"(local env=getfenv() local log=''
+                    local function argument()
+                        log..='arg' env.tonumber=function(n) log..='new' return n+10 end return 3,nil end
+                    local result=tonumber(argument()) return result,log)",
+                R"(local env=getfenv() local convert=tonumber
+                    local function argument() env.tonumber=function() return 99 end return '7' end
+                    return convert(argument()))",
+                R"(local env=getfenv()
+                    local function argument() env.math={max=function(...) return 99 end} return 3,4 end
+                    return math.max(argument()))",
+            })
+            {
+                auto output = decompile(Luau::compile(source, options));
+                check(evaluate(output, options) == evaluate(source, options),
+                    "inlined calls must preserve fallback lookups and saved callees (opt=" + std::to_string(optimization) + "):\n" + output);
+            }
+        }
+}
+
+void callbackInlining()
+{
+    const char* source = R"(local value=1
+        local function protected(a,...) value+=a return value,... end
+        local ok,result=pcall(protected,2,'tail')
+        local function scheduled() value+=result end task.spawn(scheduled)
+        task.spawn(function() pcall(function() value+=1 end) end)
+        return ok,value)";
+    for (int optimization : {0, 1, 2})
+        for (int debug : {0, 2})
+        {
+            Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+            auto output = decompile(Luau::compile(source, options));
+            check(output.find("local function ") == std::string::npos, "single-use callback declarations should disappear:\n" + output);
+            check(output.find("pcall(function(") != std::string::npos, "pcall callback should be embedded");
+            check(output.find("task.spawn(function()") != std::string::npos, "spawn callback should be embedded");
+            const char* task = "task={spawn=function(callback,...) return callback(...) end} ";
+            check(evaluate(task + output) == evaluate(std::string(task) + source), "inline callbacks must preserve captures and results");
+        }
+
+    Luau::CompileOptions options; options.optimizationLevel = 0; options.debugLevel = 2;
+    auto shared = decompile(Luau::compile(R"(local function callback() return 1 end
+        pcall(callback) task.spawn(callback))", options));
+    check(shared.find("local function callback(") != std::string::npos && shared.find("pcall(callback)") != std::string::npos &&
+        shared.find("task.spawn(callback)") != std::string::npos, "shared callbacks must retain one binding");
+
+    auto recursive = decompile(Luau::compile(R"(local function callback(n)
+        if n>0 then return callback(n-1) end return 0 end pcall(callback,3))", options));
+    check(recursive.find("local function callback(") != std::string::npos && recursive.find("pcall(callback, 3)") != std::string::npos,
+        "recursive callbacks must retain their self binding");
+
+    auto loop = decompile(Luau::compile(R"(local n=0 local function callback() return n end
+        while pcall(callback) do n+=1 if n>2 then break end end)", options));
+    check(loop.find("local function callback(") != std::string::npos, "loop conditions must reuse the original callback");
+}
+
+void inliningAndDebugNames()
+{
+    Luau::CompileOptions options; options.optimizationLevel = 0; options.debugLevel = 2;
+    auto output = decompile(Luau::compile(R"(local function fill(t,input)
+        local key=input.key local value=input.value t[key]=value
+        local amount=math.abs(-2) t.amount=amount
+        local call=print local function callback() return 1 end call(callback)
+        return t end return fill)", options));
+    check(output.find("local v_") == std::string::npos, "single-use operands should not leave temporary declarations:\n" + output);
+    check(output.find("v_0[v_1.key] = v_1.value") != std::string::npos, "table keys and values should be substituted");
+    check(output.find("v_0.amount = math.abs(-2)") != std::string::npos, "table stores should accept inline calls");
+    check(output.find("print(function()") != std::string::npos, "callee and its single-use callback should inline");
+    check(output.find("local function fill(") != std::string::npos, "function should retain its debugname");
+
+    auto branch = decompile(Luau::compile(R"(local function choose(value,condition)
+        local alias=value if condition then return alias end return 0 end return choose)", options));
+    check(branch.find("local v_") == std::string::npos, "immutable single-use aliases should inline into branches");
+
+    auto shared = decompile(Luau::compile(R"(local value=input return value,value)", options));
+    check(shared.find("local v_0 = input") != std::string::npos, "multiple reads must retain a shared binding");
+
+    auto recursive = decompile(Luau::compile(R"(local function factorial(n)
+        if n<=1 then return 1 end return n*factorial(n-1) end return factorial(6))", options));
+    check(recursive.find("local function factorial(") != std::string::npos && recursive.find("factorial(v_0 - 1)") != std::string::npos,
+        "recursive calls must use the debugname");
+
+    const char* collisionSource = R"(local function first(n) return math.abs(n) end
+        local function second(n) return first(n)+1 end return second(-3))";
+    auto ir = lift(Luau::compile(collisionSource, options));
+    for (auto& fn : ir.functions) if (fn.id) fn.debugname = "math";
+    auto collision = printAST(buildAST(buildSSA(buildCFG(std::move(ir)))));
+    check(collision.find("local function math_1(") != std::string::npos && collision.find("local function math_2(") != std::string::npos,
+        "debugnames must avoid global and local name collisions");
+    check(evaluate(collision) == evaluate(collisionSource), "name collisions must not change global lookup or captured calls");
+
+    for (const char* invalid : {"end", "a.b", "two words", ""})
+    {
+        auto invalidIR = lift(Luau::compile("local function named(n) return n+1 end return named(2)", options));
+        invalidIR.functions.at(1).debugname = invalid;
+        auto fallback = printAST(buildAST(buildSSA(buildCFG(std::move(invalidIR)))));
+        check(fallback.find("local function f_0(") != std::string::npos, "invalid debugnames need a valid generated name");
+        check(evaluate(fallback) == evaluate("return 3"), "invalid debugname fallback must compile and execute");
+    }
+}
 }
 
 int main(int argc, char** argv)
@@ -277,7 +639,7 @@ int main(int argc, char** argv)
             }
             return 0;
         }
-        roundTrips(); stagesAndNames();
+        roundTrips(); branchRecovery(); stagesAndNames(); inliningAndDebugNames(); callbackInlining(); argumentAliases(); singleUseCallAndStoreValues();
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -59,6 +59,7 @@ struct IRInstruction
     IROp op;
     uint32_t pc;
     std::vector<IROperand> operands;
+    bool argumentsBeforeCallee = false; // CALL from a FASTCALL fallback sequence.
 };
 
 struct IRBlock

@@ -70,8 +70,9 @@ Captures distinguish values, register references, and inherited upvalues. Table 
 and class shapes are copied before the temporary VM closes. `IRImmediate` (`#` in dumps)
 represents metadata, including the VM function ID for `PROTO_MISMATCH`.
 
-Fast-call hints use their ordinary fallback instructions; coverage counters, NOPs, and
-vararg stack setup are omitted. Runtime-only instructions and invalid instruction boundaries
+Fast-call hints use their ordinary fallback instructions; their `CALL` retains
+`argumentsBeforeCallee` so expression reconstruction preserves the fallback lookup order.
+Coverage counters, NOPs, and vararg stack setup are omitted. Runtime-only instructions and invalid instruction boundaries
 raise `std::runtime_error`. Input must be compiler-produced bytecode: the Luau loader is
 not a validator for arbitrary binary data.
 
@@ -118,21 +119,38 @@ std::string source = printAST(ast);
   instructions reconstruct class declarations and require the corresponding bundled Luau flags.
 
 Generated locals and parameters use `v_0`, `v_1`, ...; captured bindings use `uv_0`,
-`uv_1`, ...; local functions use `f_0`, `f_1`, .... Each counter is independent and starts
-at zero for the output chunk. Numbers follow **printed declaration order**, including
-nested function bodies, rather than registers or prototype IDs. Captured functions retain
-their `f_` binding, including recursive self references. Globals, property/method names,
-and runtime class names retain their semantic names.
+`uv_1`, .... Local functions use their bytecode `debugname` when it is a valid identifier,
+and otherwise use `f_0`, `f_1`, .... Conflicting debug names receive a numeric suffix;
+generated names skip names reserved by debug information, globals, and classes. Each
+counter is independent and starts at zero for the output chunk. Numbers follow **printed
+declaration order**, including nested function bodies, rather than registers or prototype
+IDs. Captured functions and recursive self references share the function's chosen name.
+Globals, property/method names, and runtime class names retain their semantic names.
+
+Single-use temporary values are substituted directly into arguments, table keys/values,
+returns, and other expressions when evaluation order can be preserved. Immutable aliases
+can also be substituted into branches and loops. Shared or mutable bindings, capture
+snapshots, and temporaries needed to preserve side effects retain their declarations.
+Argument copies reuse the original binding when it cannot change before the use,
+including loop variables, parameters reassigned later, and read-only captures.
+Property arguments are folded into the call when their evaluation order is preserved.
+Nested builtin calls and their arguments are folded using Luau's fast-call evaluation
+order, including multiple-return arguments and results stored in table fields.
+Single-use callbacks passed as arguments, including `pcall(function(...) ... end)` and
+`task.spawn(function(...) ... end)`, are embedded directly in the call, even when they
+have a debug name. Single-use functions stored in table fields or constructors are
+embedded there as well. Shared and recursive callbacks keep their named declarations;
+closures defined outside a loop retain their identity across iterations.
 
 For example:
 
 ```lua
 local uv_0 = 1
-local function f_0(v_0)
+local function add(v_0)
     uv_0 = uv_0 + v_0
     return uv_0
 end
-return f_0(2)
+return add(2)
 ```
 
 The decompiler recovers source structure from compiler-produced bytecode. Comments,

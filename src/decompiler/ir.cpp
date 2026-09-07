@@ -322,6 +322,7 @@ struct FunctionLifter
             return {it->second};
         };
 
+        std::set<uint32_t> fastcalls;
         size_t blockIndex = 0;
         for (const auto& insn : code)
         {
@@ -348,10 +349,13 @@ struct FunctionLifter
             static constexpr IROp arithmetic[] = {IROp::ADD, IROp::SUB, IROp::MUL, IROp::DIV, IROp::MOD, IROp::POW};
             switch (op)
             {
-            // Fast paths are redundant with the following fallback bytecode, including CALL.
             case LOP_NOP: case LOP_COVERAGE: case LOP_PREPVARARGS:
+                break;
+            // Execute the ordinary fallback, but retain its argument-before-
+            // callee evaluation order when reconstructing the call expression.
             case LOP_FASTCALL: case LOP_FASTCALL1: case LOP_FASTCALL2:
             case LOP_FASTCALL2K: case LOP_FASTCALL3: case LOP_FASTPCALL:
+                fastcalls.insert(pc + 1 + c);
                 break;
             case LOP_LOADNIL: emit(IROp::MOVE, {reg(a), IRConstantNil{}}); break;
             case LOP_LOADB:
@@ -408,7 +412,8 @@ struct FunctionLifter
                 emit(IROp::NAMECALL, {reg(a), reg(b), k(op == LOP_NAMECALLUDATA ? aux & 0xffff : aux)});
                 break;
             case LOP_CALL: case LOP_CALLFB:
-                emit(IROp::CALL, {range(a, int(c) - 1), reg(a), range(a + 1, int(b) - 1)}); break;
+                emit(IROp::CALL, {range(a, int(c) - 1), reg(a), range(a + 1, int(b) - 1)}).argumentsBeforeCallee = fastcalls.count(pc) != 0;
+                break;
             case LOP_GETVARARGS: emit(IROp::VARARGS, {range(a, int(b) - 1)}); break;
             case LOP_RETURN:
                 emit(IROp::RETURN, {range(a, int(b) - 1)});

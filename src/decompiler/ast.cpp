@@ -394,6 +394,8 @@ void FunctionBuilder::instruction(ASTBlock& out, uint32_t b, uint32_t i)
     {
         auto id = dest()->symbol;
         builder.ast.symbols[id].kind = ASTSymbol::Kind::FUNCTION;
+        if (!builder.ast.symbols[id].debugname)
+            builder.ast.symbols[id].debugname = builder.ssa.cfg.ir.functions.at(std::get<IRFunctionRef>(o[1]).ref).debugname;
         std::vector<ASTSymbolId> captures;
         for (size_t n = 2; n < o.size(); ++n)
         {
@@ -444,6 +446,18 @@ void FunctionBuilder::instruction(ASTBlock& out, uint32_t b, uint32_t i)
             ++args.start; if (args.count >= 0) --args.count;
         }
         else e = expr(EK::CALL, {}, {get(1)});
+        e->argumentsBeforeCallee = insn.argumentsBeforeCallee;
+        if (e->argumentsBeforeCallee && origin.kind == SSAValue::Kind::INSTRUCTION && origin.block == b && origin.instruction + 1 == i &&
+            !out.empty() && out.back().kind == SK::ASSIGN && out.back().lhs.size() == 1 && out.back().rhs.size() == 1 &&
+            out.back().lhs[0]->kind == EK::SYMBOL && e->children[0]->kind == EK::SYMBOL &&
+            out.back().lhs[0]->symbol == e->children[0]->symbol && !builder.ast.symbols[e->children[0]->symbol].captured)
+        {
+            // The fallback loads the function after evaluating its arguments.
+            // Attach that load now: open-result arguments are stored as nested
+            // expressions and must still execute before the callee lookup.
+            e->children[0] = out.back().rhs[0];
+            out.pop_back();
+        }
         auto arguments = range(args, b, i);
         e->children.insert(e->children.end(), arguments.begin(), arguments.end());
         results(std::get<IRRegisterRange>(o[0]), e); break;
@@ -507,9 +521,22 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
     {
         if (active && b == active->exit)
         { out.push_back(ASTStatement{SK::BREAK}); return; }
-        if (active && visited[b] && (b == active->continuation || b == active->header))
+        bool loopEpilogue = active && active->forLoop && b == active->latch;
+        if (active && visited[b] && (b == active->continuation || b == active->header) && !loopEpilogue)
         { out.push_back(ASTStatement{SK::CONTINUE}); return; }
-        if (visited[b]) fail(b, "control-flow region overlaps an already emitted region");
+        if (visited[b])
+        {
+            // The compiler shares tiny boolean/nil materialization tails across
+            // expression paths. Repeating those copies is harmless; repeating
+            // an effectful block or rebuilding a closure is not.
+            const auto& code = ir.blocks[b].instructions;
+            bool materialization = code.back().op == IROp::JUMP || code.back().op == IROp::RETURN;
+            for (size_t i = 0; i + 1 < code.size(); ++i)
+                materialization &= code[i].op == IROp::MOVE && code[i].operands.size() == 2 &&
+                    (std::holds_alternative<IRConstantNil>(code[i].operands[1]) ||
+                     std::holds_alternative<IRConstantBool>(code[i].operands[1]));
+            if (!materialization && !loopEpilogue) fail(b, "control-flow region overlaps an already emitted region");
+        }
         const auto& term = ir.blocks[b].instructions.back();
         uint32_t ti = uint32_t(ir.blocks[b].instructions.size() - 1);
 
@@ -620,7 +647,8 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                 if (!active->forLoop && !active->repeat) { out.push_back(ASTStatement{SK::CONTINUE}); return; }
                 // An explicit continue target is a separate block containing only
                 // the latch (or repeat condition). Ordinary fallthrough emits it.
-                if (next != b + 1) { out.push_back(ASTStatement{SK::CONTINUE}); return; }
+                if (next != b + 1 && (!active->forLoop || ir.blocks[next].instructions.size() == 1))
+                { out.push_back(ASTStatement{SK::CONTINUE}); return; }
             }
             b = next; break;
         }
@@ -636,12 +664,77 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                 }
                 b = cfg.blocks[b].successors[0]; break;
             }
-            uint32_t taken = cfg.blocks[b].successors[0], fallthrough = cfg.blocks[b].successors[1];
+            // Plan short-circuit regions from the inside out before emitting
+            // either arm. Planning must not create symbols/closures or mark blocks
+            // visited: an outer test may be unable to absorb a candidate region.
+            struct TestRegion
+            {
+                struct Step { bool onTaken, sharedTaken; std::shared_ptr<TestRegion> child; };
+                uint32_t entry, taken, fallthrough;
+                std::set<uint32_t> nodes;
+                std::vector<Step> steps;
+            };
+            std::function<TestRegion(uint32_t, std::set<uint32_t>, uint32_t)> planTest;
+            planTest = [&](uint32_t entry, std::set<uint32_t> available, uint32_t boundary) {
+                const auto& successors = cfg.blocks[entry].successors;
+                TestRegion plan{entry, successors[0], successors[1], {entry}, {}};
+                available.insert(entry);
+                for (;;)
+                {
+                    if (plan.taken == boundary || plan.fallthrough == boundary) return plan;
+                    bool merged = false;
+                    for (bool onTaken : {true, false})
+                    {
+                        uint32_t child = onTaken ? plan.taken : plan.fallthrough;
+                        uint32_t shared = onTaken ? plan.fallthrough : plan.taken;
+                        if (child <= entry || child == stop || child >= exit || visited[child] || available.count(child) ||
+                            (active && (child == active->header || child == active->continuation || child == active->exit))) continue;
+                        const auto& node = cfg.blocks[child];
+                        if (ir.blocks[child].instructions.back().op != IROp::BRANCH || node.successors.size() != 2 ||
+                            std::any_of(node.predecessors.begin(), node.predecessors.end(),
+                                [&](uint32_t pred) { return cfg.blocks[pred].reachable && !available.count(pred); }) ||
+                            std::any_of(cfg.loops.begin(), cfg.loops.end(),
+                                [&](const CFGLoop& loop) { return loop.header == child; })) continue;
+                        auto nested = planTest(child, available, shared);
+                        bool sharedTaken = nested.taken == shared;
+                        if (!sharedTaken && nested.fallthrough != shared) continue;
+                        plan.taken = sharedTaken ? nested.fallthrough : nested.taken;
+                        plan.fallthrough = shared;
+                        available.insert(nested.nodes.begin(), nested.nodes.end());
+                        plan.nodes.insert(nested.nodes.begin(), nested.nodes.end());
+                        plan.steps.push_back({onTaken, sharedTaken, std::make_shared<TestRegion>(std::move(nested))});
+                        merged = true;
+                        break;
+                    }
+                    if (!merged) return plan;
+                }
+            };
+            std::function<ASTExpr(ASTBlock&, const TestRegion&)> emitTest;
+            emitTest = [&](ASTBlock& output, const TestRegion& plan) {
+                auto test = condition(plan.entry);
+                for (const auto& step : plan.steps)
+                {
+                    auto result = symbol(builder.newSymbol(function->id));
+                    ASTStatement evaluation{SK::IF};
+                    evaluation.condition = step.onTaken ? test : negate(test);
+                    visited[step.child->entry] = true;
+                    instructions(evaluation.body, step.child->entry);
+                    auto childTest = emitTest(evaluation.body, *step.child);
+                    evaluation.body.push_back(assign({result}, {step.sharedTaken ? negate(childTest) : childTest}));
+                    evaluation.alternative.push_back(assign({result}, {literal("false")}));
+                    output.push_back(std::move(evaluation));
+                    test = result;
+                }
+                return test;
+            };
+            auto plan = planTest(b, {}, exit);
+            uint32_t taken = plan.taken, fallthrough = plan.fallthrough;
+            ASTExpr test = emitTest(out, plan);
             auto takenAction = transfer(taken), fallthroughAction = transfer(fallthrough);
             if (takenAction || fallthroughAction)
             {
                 ASTStatement guard{SK::IF};
-                guard.condition = takenAction ? condition(b) : negate(condition(b));
+                guard.condition = takenAction ? test : negate(test);
                 guard.body.push_back(ASTStatement{takenAction ? *takenAction : *fallthroughAction});
                 out.push_back(std::move(guard));
                 if (takenAction && fallthroughAction) { out.push_back(ASTStatement{*fallthroughAction}); return; }
@@ -649,20 +742,49 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                 break;
             }
             uint32_t join = cfg.blocks[b].immediatePostDominator < 0 ? exit : uint32_t(cfg.blocks[b].immediatePostDominator);
+            bool terminalJoin = join == exit || (active &&
+                (join == active->exit || join == active->header || join == active->continuation));
             if (active && join == active->exit) join = active->continuation;
             if (active && (join == active->header || join == active->continuation)) join = stop;
-            ASTStatement branch{SK::IF}; branch.condition = negate(condition(b));
-            auto before = visited;
+            auto reachableBeforeBoundary = [&](uint32_t from) {
+                std::vector<bool> seen(exit);
+                std::vector<uint32_t> work{from};
+                while (!work.empty())
+                {
+                    auto node = work.back(); work.pop_back();
+                    if (node == exit || seen[node]) continue;
+                    seen[node] = true;
+                    if (node == stop || visited[node] || transfer(node)) continue;
+                    for (auto successor : cfg.blocks[node].successors) work.push_back(successor);
+                }
+                return seen;
+            };
+            // Returns and loop transfers need not pass through the continuation.
+            // Respect the enclosing boundary, then recover a shared successor
+            // when strict postdominance can only identify the function/loop exit.
+            if (terminalJoin)
+            {
+                auto yes = reachableBeforeBoundary(taken), no = reachableBeforeBoundary(fallthrough);
+                if (stop != exit && (yes[stop] || no[stop])) join = stop;
+                // Bytecode blocks are ordered by PC. The first shared forward
+                // block is the continuation of a structured source branch, even
+                // when either arm also has paths ending in return/continue.
+                for (uint32_t node = b + 1; node < exit; ++node)
+                    if (yes[node] && no[node] && !visited[node] && !transfer(node))
+                    { join = node; break; }
+            }
+            ASTStatement branch{SK::IF}; branch.condition = negate(test);
             region(branch.body, fallthrough, join, active);
-            auto thenVisited = visited;
-            visited = before;
             region(branch.alternative, taken, join, active);
-            for (size_t node = 0; node < visited.size(); ++node) visited[node] = visited[node] || thenVisited[node];
             out.push_back(std::move(branch));
             b = join; break;
         }
         case IROp::FORNLOOP: case IROp::FORGLOOP:
             if (!active || !active->forLoop) fail(b, "loop latch outside its loop");
+            // A branch can enter the iteration epilogue early (for example an
+            // inlined return). Execute its instructions, then actually transfer
+            // to the next iteration instead of falling through the enclosing if.
+            out.push_back(ASTStatement{SK::CONTINUE});
             return;
         default: fail(b, "unsupported terminator");
         }
@@ -741,29 +863,75 @@ bool stable(const ASTExpr& e, const ASTContext& ast, const Usage& uses)
     if (!e) return true;
     if (e->kind == EK::LITERAL) return true;
     if (e->kind == EK::SYMBOL)
-        return !ast.symbols[e->symbol].captured && !ast.symbols[e->symbol].loopVariable && uses.writes[e->symbol] <= 1;
+    {
+        const auto& info = ast.symbols[e->symbol];
+        return !info.loopVariable && uses.writes[e->symbol] <= (info.parameter ? 0u : 1u);
+    }
     if (e->kind == EK::UNARY && e->text == "not") return stable(e->children[0], ast, uses);
     return false;
+}
+// These expressions neither execute user code nor snapshot a shared mutable
+// binding. A closure's value captures have already been made explicit above.
+bool passive(const ASTExpr& e, const ASTContext& ast)
+{
+    if (!e || e->kind == EK::LITERAL || e->kind == EK::VARARGS || e->kind == EK::FUNCTION) return true;
+    if (e->kind == EK::SYMBOL) return !ast.symbols[e->symbol].captured;
+    if (e->kind == EK::UNARY && e->text == "not") return passive(e->children[0], ast);
+    return e->kind == EK::TABLE && e->fields.empty();
+}
+bool writesSymbol(const ASTStatement& s, ASTSymbolId id)
+{
+    for (const auto& lhs : s.lhs) if (lhs->kind == EK::SYMBOL && lhs->symbol == id) return true;
+    if (std::find(s.names.begin(), s.names.end(), id) != s.names.end()) return true;
+    for (const auto& child : s.body) if (writesSymbol(child, id)) return true;
+    for (const auto& child : s.alternative) if (writesSymbol(child, id)) return true;
+    return false;
+}
+bool canMovePast(const ASTStatement& s, const ASTExpr& value, const ASTContext& ast)
+{
+    // Calls cannot reassign an uncaptured local. A copy can cross unrelated
+    // effects, but must stop at any direct or conditional write to its source.
+    if (value->kind == EK::SYMBOL && !ast.symbols[value->symbol].captured)
+        return !writesSymbol(s, value->symbol);
+    if (s.kind != SK::ASSIGN) return false;
+    for (const auto& lhs : s.lhs)
+        if (lhs->kind != EK::SYMBOL || ast.symbols[lhs->symbol].captured || count(value, lhs->symbol)) return false;
+    for (const auto& rhs : s.rhs) if (!passive(rhs, ast)) return false;
+    return true;
 }
 bool firstUse(const ASTExpr& e, ASTSymbolId id, bool& barrier, bool conditional, const ASTContext& ast, const Usage& uses)
 {
     if (!e) return false;
     if (e->kind == EK::SYMBOL && e->symbol == id) return !barrier && !conditional;
     for (size_t i = 0; i < e->children.size(); ++i)
-        if (firstUse(e->children[i], id, barrier, conditional || (e->kind == EK::BINARY && i == 1 && (e->text == "and" || e->text == "or")) ||
-            (e->kind == EK::CONDITIONAL && i > 0), ast, uses)) return true;
+    {
+        // Luau compiles fast-call arguments before the fallback callee lookup.
+        // Inspect that order so the lookup does not block folding its arguments.
+        size_t child = e->kind == EK::CALL && e->argumentsBeforeCallee ? (i + 1) % e->children.size() : i;
+        if (firstUse(e->children[child], id, barrier, conditional || (e->kind == EK::BINARY && child == 1 && (e->text == "and" || e->text == "or")) ||
+            (e->kind == EK::CONDITIONAL && child > 0), ast, uses)) return true;
+    }
     for (auto& f : e->fields)
         if (firstUse(f.key, id, barrier, conditional, ast, uses) || firstUse(f.value, id, barrier, conditional, ast, uses)) return true;
-    if (!stable(e, ast, uses) && !(e->kind == EK::SYMBOL && !ast.symbols[e->symbol].captured)) barrier = true;
+    if (!stable(e, ast, uses) && !passive(e, ast)) barrier = true;
     return false;
 }
 bool canInline(const ASTStatement& s, ASTSymbolId id, const ASTExpr& value, const ASTContext& ast, const Usage& uses)
 {
-    if (s.kind == SK::WHILE || s.kind == SK::REPEAT) return false;
     if (stable(value, ast, uses)) return true;
+    if (s.kind == SK::WHILE || s.kind == SK::REPEAT) return false;
+    // A later assignment or loop iteration does not require a snapshot for
+    // this expression: its local writes happen after the operands are read.
+    if (value->kind == EK::SYMBOL && !ast.symbols[value->symbol].captured) return true;
     bool barrier = false;
     for (auto& e : s.lhs)
-        if (e->kind != EK::SYMBOL && firstUse(e, id, barrier, false, ast, uses)) return true;
+        // An assignment evaluates the table and key, but does not read the
+        // indexed value. The actual store happens after evaluating the RHS.
+        if (e->kind == EK::INDEX)
+        {
+            for (auto& child : e->children) if (firstUse(child, id, barrier, false, ast, uses)) return true;
+        }
+        else if (e->kind != EK::SYMBOL && firstUse(e, id, barrier, false, ast, uses)) return true;
     for (auto& e : s.rhs) if (firstUse(e, id, barrier, false, ast, uses)) return true;
     return firstUse(s.condition, id, barrier, false, ast, uses);
 }
@@ -773,6 +941,46 @@ void substitute(ASTStatement& s, ASTSymbolId id, const ASTExpr& value)
     for (auto& e : s.lhs) if (e->kind != EK::SYMBOL) eachExpr(e, replace, false);
     for (auto& e : s.rhs) eachExpr(e, replace, false);
     eachExpr(s.condition, replace, false);
+}
+bool functionValueUse(const ASTExpr& e, ASTSymbolId id)
+{
+    if (!e) return false;
+    if (e->kind == EK::CALL || e->kind == EK::METHOD_CALL)
+        for (size_t i = 1; i < e->children.size(); ++i)
+            if (e->children[i]->kind == EK::SYMBOL && e->children[i]->symbol == id) return true;
+    for (const auto& child : e->children) if (functionValueUse(child, id)) return true;
+    for (const auto& field : e->fields)
+    {
+        if (field.value->kind == EK::SYMBOL && field.value->symbol == id) return true;
+        if (functionValueUse(field.key, id) || functionValueUse(field.value, id)) return true;
+    }
+    return false;
+}
+bool functionValueUse(const ASTStatement& s, ASTSymbolId id)
+{
+    // Moving a closure into a loop condition would create a new function on
+    // every iteration. Keep its original identity and capture lifetime.
+    if (s.kind == SK::WHILE || s.kind == SK::REPEAT) return false;
+    if (s.kind == SK::ASSIGN && s.lhs.size() == 1 && s.lhs[0]->kind == EK::INDEX && s.rhs.size() == 1 &&
+        s.rhs[0]->kind == EK::SYMBOL && s.rhs[0]->symbol == id) return true;
+    for (const auto& e : s.lhs) if (functionValueUse(e, id)) return true;
+    for (const auto& e : s.rhs) if (functionValueUse(e, id)) return true;
+    return functionValueUse(s.condition, id);
+}
+bool inlineUse(ASTStatement& s, ASTSymbolId id, const ASTExpr& value, const ASTContext& ast, const Usage& uses)
+{
+    if (directUses(s, id) == 1 && (value->kind == EK::FUNCTION ? functionValueUse(s, id) : canInline(s, id, value, ast, uses)))
+    {
+        substitute(s, id, value); return true;
+    }
+    // Only immutable values can move into a branch or be evaluated repeatedly
+    // in a loop. Calls and other observable evaluations stay on their path.
+    if (stable(value, ast, uses))
+    {
+        for (auto& child : s.body) if (inlineUse(child, id, value, ast, uses)) return true;
+        for (auto& child : s.alternative) if (inlineUse(child, id, value, ast, uses)) return true;
+    }
+    return false;
 }
 
 bool foldTables(ASTBlock& block, ASTContext& ast)
@@ -867,7 +1075,9 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
 bool equalExpr(const ASTExpr& a, const ASTExpr& b)
 {
     if (!a || !b) return a == b;
-    if (a->kind != b->kind || a->text != b->text || a->symbol != b->symbol || a->children.size() != b->children.size() || a->function || b->function || !a->fields.empty() || !b->fields.empty()) return false;
+    if (a->kind != b->kind || a->text != b->text || a->symbol != b->symbol || a->children.size() != b->children.size() ||
+        a->multret != b->multret || a->argumentsBeforeCallee != b->argumentsBeforeCallee ||
+        a->function || b->function || !a->fields.empty() || !b->fields.empty()) return false;
     for (size_t i = 0; i < a->children.size(); ++i) if (!equalExpr(a->children[i], b->children[i])) return false;
     return true;
 }
@@ -875,6 +1085,35 @@ bool booleanExpr(const ASTExpr& e)
 {
     return (e->kind == EK::UNARY && e->text == "not") || (e->kind == EK::LITERAL && (e->text == "true" || e->text == "false")) ||
         (e->kind == EK::BINARY && (e->text == "==" || e->text == "~=" || e->text == "<" || e->text == "<=" || e->text == ">" || e->text == ">="));
+}
+// Only truthiness is observed in conditions. Here a false-valued conditional
+// can use and/or even when its operands themselves can be nil or non-booleans.
+bool simplifyCondition(ASTExpr& e)
+{
+    if (!e) return false;
+    bool changed = false;
+    if (e->kind == EK::CONDITIONAL)
+    {
+        auto yes = e->children[1], no = e->children[2];
+        auto falsy = [](const ASTExpr& value) {
+            return value->kind == EK::LITERAL && (value->text == "false" || value->text == "nil");
+        };
+        if (falsy(no)) { e = expr(EK::BINARY, "and", {e->children[0], yes}); changed = true; }
+        else if (falsy(yes)) { e = expr(EK::BINARY, "and", {negate(e->children[0]), no}); changed = true; }
+        else if (yes->kind == EK::LITERAL && yes->text == "true")
+        { e = expr(EK::BINARY, "or", {e->children[0], no}); changed = true; }
+        else if (no->kind == EK::LITERAL && no->text == "true")
+        { e = expr(EK::BINARY, "or", {negate(e->children[0]), yes}); changed = true; }
+    }
+    if ((e->kind == EK::UNARY && e->text == "not") ||
+        (e->kind == EK::BINARY && (e->text == "and" || e->text == "or")))
+    {
+        // Expressions can be shared with assignments where their exact value
+        // still matters; don't rewrite children through those shared pointers.
+        e = std::make_shared<ASTExpression>(*e);
+        for (auto& child : e->children) changed |= simplifyCondition(child);
+    }
+    return changed;
 }
 bool hasContinue(const ASTBlock& block)
 {
@@ -922,7 +1161,9 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
         changed |= optimizeBlock(s.body, ast, uses);
         changed |= optimizeBlock(s.alternative, ast, uses);
         auto nested = [&](ASTExpr& e) { if (e->function) changed |= optimizeBlock(e->function->body, ast, uses); };
+        for (auto& e : s.lhs) eachExpr(e, nested, false);
         for (auto& e : s.rhs) eachExpr(e, nested, false);
+        eachExpr(s.condition, nested, false);
     }
     changed |= foldTables(block, ast);
     for (size_t i = 0; i < block.size(); ++i)
@@ -933,7 +1174,8 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
         if (s.rhs[0]->kind == EK::SYMBOL && s.rhs[0]->symbol == id)
         { block.erase(block.begin() + i--); changed = true; continue; }
         const auto& info = ast.symbols[id];
-        if (info.captured || info.parameter || info.loopVariable || info.kind == ASTSymbol::Kind::FUNCTION || uses.writes[id] != 1) continue;
+        if (info.captured || info.parameter || info.loopVariable || uses.writes[id] != 1) continue;
+        if (info.kind == ASTSymbol::Kind::FUNCTION && s.rhs[0]->kind != EK::FUNCTION) continue;
         if (uses.reads[id] == 0 && (stable(s.rhs[0], ast, uses) || s.rhs[0]->kind == EK::VARARGS))
         { block.erase(block.begin() + i--); changed = true; continue; }
         if (uses.reads[id] == 0 && (s.rhs[0]->kind == EK::CALL || s.rhs[0]->kind == EK::METHOD_CALL))
@@ -941,11 +1183,14 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
         if (uses.reads[id] != 1) continue;
         for (size_t j = i + 1; j < block.size(); ++j)
         {
-            if (directUses(block[j], id) == 1 && canInline(block[j], id, s.rhs[0], ast, uses))
+            if (inlineUse(block[j], id, s.rhs[0], ast, uses))
             {
-                substitute(block[j], id, s.rhs[0]); block.erase(block.begin() + i--); changed = true; break;
+                block.erase(block.begin() + i--); changed = true; break;
             }
-            if (!stable(s.rhs[0], ast, uses)) break;
+            // Constructing a callback does not execute its body. Its value
+            // captures are explicit snapshots, so it can move past effects
+            // to its sole argument use in this same block.
+            if (s.rhs[0]->kind != EK::FUNCTION && !stable(s.rhs[0], ast, uses) && !canMovePast(block[j], s.rhs[0], ast)) break;
         }
     }
     // Merge iterator triplets back into their originating multiple-result call.
@@ -960,6 +1205,7 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
     }
     for (auto& s : block)
     {
+        changed |= simplifyCondition(s.condition);
         if (s.kind == SK::WHILE && s.condition->kind == EK::LITERAL && s.condition->text == "true" && !s.body.empty())
         {
             auto& guard = s.body.front();
@@ -1091,19 +1337,58 @@ void declareFunction(ASTFunction& fn, ASTContext& ast)
 struct Printer
 {
     const ASTContext& ast;
-    explicit Printer(const ASTContext& ast) : ast(ast) {}
+    explicit Printer(const ASTContext& ast) : ast(ast)
+    {
+        for (const auto& info : ast.symbols)
+            if (info.kind == ASTSymbol::Kind::FUNCTION && info.debugname && identifier(*info.debugname))
+                preferredNames.insert(*info.debugname);
+        reserveNames(ast.entry->body);
+    }
     std::ostringstream out;
     std::map<ASTSymbolId, std::string> names;
+    std::set<std::string> preferredNames;
+    std::set<std::string> usedNames{"getfenv"};
     uint32_t variables = 0, upvalues = 0, functions = 0;
+    void reserveNames(const ASTExpr& e)
+    {
+        if (!e) return;
+        if (e->kind == EK::GLOBAL) usedNames.insert(e->text);
+        for (const auto& child : e->children) reserveNames(child);
+        for (const auto& field : e->fields) { reserveNames(field.key); reserveNames(field.value); }
+        if (e->function) reserveNames(e->function->body);
+    }
+    void reserveNames(const ASTBlock& body)
+    {
+        for (const auto& s : body)
+        {
+            if (s.kind == SK::CLASS) usedNames.insert(s.text);
+            for (const auto& e : s.lhs) reserveNames(e);
+            for (const auto& e : s.rhs) reserveNames(e);
+            reserveNames(s.condition); reserveNames(s.body); reserveNames(s.alternative);
+        }
+    }
     void indent(unsigned depth) { out << std::string(depth * 4, ' '); }
     const std::string& name(ASTSymbolId id, bool declaration = false)
     {
         auto it = names.find(id);
         if (it != names.end()) return it->second;
         if (!declaration) throw std::runtime_error("AST printer: symbol used before its declaration");
-        auto kind = ast.symbols.at(id).kind;
-        std::string text = kind == ASTSymbol::Kind::FUNCTION ? "f_" + std::to_string(functions++) :
-            kind == ASTSymbol::Kind::UPVALUE ? "uv_" + std::to_string(upvalues++) : "v_" + std::to_string(variables++);
+        const auto& info = ast.symbols.at(id);
+        std::string text;
+        if (info.kind == ASTSymbol::Kind::FUNCTION && info.debugname && identifier(*info.debugname))
+        {
+            text = *info.debugname;
+            for (unsigned suffix = 1; usedNames.count(text) || (text != *info.debugname && preferredNames.count(text)); ++suffix)
+                text = *info.debugname + "_" + std::to_string(suffix);
+        }
+        else
+        {
+            do
+                text = info.kind == ASTSymbol::Kind::FUNCTION ? "f_" + std::to_string(functions++) :
+                    info.kind == ASTSymbol::Kind::UPVALUE ? "uv_" + std::to_string(upvalues++) : "v_" + std::to_string(variables++);
+            while (usedNames.count(text) || preferredNames.count(text));
+        }
+        usedNames.insert(text);
         return names.emplace(id, std::move(text)).first->second;
     }
     int precedence(const ASTExpr& e)
