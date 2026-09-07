@@ -673,6 +673,7 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                 uint32_t entry, taken, fallthrough;
                 std::set<uint32_t> nodes;
                 std::vector<Step> steps;
+                uint32_t prefix = UINT32_MAX;
             };
             std::function<TestRegion(uint32_t, std::set<uint32_t>, uint32_t)> planTest;
             planTest = [&](uint32_t entry, std::set<uint32_t> available, uint32_t boundary) {
@@ -696,6 +697,41 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                             std::any_of(cfg.loops.begin(), cfg.loops.end(),
                                 [&](const CFGLoop& loop) { return loop.header == child; })) continue;
                         auto nested = planTest(child, available, shared);
+                        // Inlined condition evaluation can contain its own ifs.
+                        // Follow their postdominators to the actual outer test.
+                        uint32_t tail = child;
+                        while (nested.taken != shared && nested.fallthrough != shared)
+                        {
+                            auto next = cfg.blocks[tail].immediatePostDominator;
+                            if (next <= int32_t(tail) || uint32_t(next) >= exit || uint32_t(next) >= shared || uint32_t(next) == stop ||
+                                visited[next] || ir.blocks[next].instructions.back().op != IROp::BRANCH ||
+                                cfg.blocks[next].successors.size() != 2) break;
+                            std::set<uint32_t> prefix;
+                            std::vector<uint32_t> work{child};
+                            bool closed = true;
+                            while (!work.empty() && closed)
+                            {
+                                auto node = work.back(); work.pop_back();
+                                if (node == uint32_t(next) || !prefix.insert(node).second) continue;
+                                if (node < child || node >= uint32_t(next) || node == stop || visited[node] ||
+                                    (active && (node == active->header || node == active->continuation || node == active->exit)) ||
+                                    std::any_of(cfg.loops.begin(), cfg.loops.end(),
+                                        [&](const CFGLoop& loop) { return loop.header == node; }))
+                                { closed = false; break; }
+                                for (auto successor : cfg.blocks[node].successors) work.push_back(successor);
+                            }
+                            prefix.insert(uint32_t(next));
+                            for (auto node : prefix)
+                                for (auto pred : cfg.blocks[node].predecessors)
+                                    if (cfg.blocks[pred].reachable && !prefix.count(pred) && !available.count(pred)) closed = false;
+                            if (!closed) break;
+                            tail = uint32_t(next);
+                            auto prefixAvailable = available;
+                            prefixAvailable.insert(prefix.begin(), prefix.end());
+                            nested = planTest(tail, std::move(prefixAvailable), shared);
+                            nested.nodes.insert(prefix.begin(), prefix.end());
+                            nested.prefix = child;
+                        }
                         bool sharedTaken = nested.taken == shared;
                         if (!sharedTaken && nested.fallthrough != shared) continue;
                         plan.taken = sharedTaken ? nested.fallthrough : nested.taken;
@@ -717,6 +753,8 @@ void FunctionBuilder::region(ASTBlock& out, uint32_t start, uint32_t stop, const
                     auto result = symbol(builder.newSymbol(function->id));
                     ASTStatement evaluation{SK::IF};
                     evaluation.condition = step.onTaken ? test : negate(test);
+                    if (step.child->prefix != UINT32_MAX)
+                        region(evaluation.body, step.child->prefix, step.child->entry, active);
                     visited[step.child->entry] = true;
                     instructions(evaluation.body, step.child->entry);
                     auto childTest = emitTest(evaluation.body, *step.child);

@@ -368,6 +368,20 @@ void branchRecovery()
                 mark('branch_body_marker')
             else mark('alternative_marker') end
             mark('shared_tail_marker'))"},
+        {"short circuit with inlined branches", R"(
+            local function read(value)
+                if b then mark('check') end
+                if c then mark('second_check') end
+                mark('read')
+                return value
+            end
+            if read(a) ~= true or read(b) ~= true then
+                mark('branch_body_marker')
+            end
+            if read(a) and read(c) then
+                mark('alternative_marker')
+            end
+            mark('shared_tail_marker'))"},
         {"condition mutation timing", R"(
             local function hit() a=not a mark('hit') return b end
             if a and hit() then mark('branch_body_marker') end
