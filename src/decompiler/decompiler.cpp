@@ -1,7 +1,7 @@
 #include "decompiler.h"
-#include "ir.h"
+#include "ast.h"
 
-void decompile(char *bytecode, int size)
+std::string decompile(std::string_view bytecode)
 {
-    IRContext *ir = lift(bytecode, size);
+    return printAST(buildAST(buildSSA(buildCFG(lift(bytecode)))));
 }
