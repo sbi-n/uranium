@@ -76,6 +76,13 @@ struct IRParameter
     std::optional<std::string> debugname;
 };
 
+struct IRLocal
+{
+    IRRegister reg;
+    uint32_t startpc, endpc;
+    std::string debugname;
+};
+
 struct IRTable
 {
     std::vector<std::pair<IROperand, IROperand>> entries;
@@ -96,6 +103,7 @@ struct IRFunction
     uint8_t upvalueCount;
     bool isVararg;
     std::vector<IRParameter> parameters;
+    std::vector<IRLocal> locals;
     std::vector<IRTable> tables;
     std::vector<IRClass> classes;
     std::vector<IRBlock> blocks;

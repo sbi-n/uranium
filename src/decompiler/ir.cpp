@@ -287,6 +287,12 @@ struct FunctionLifter
             }
             function.parameters.push_back(std::move(parameter));
         }
+        for (int i = 0; i < proto->sizelocvars; ++i)
+        {
+            const auto& local = proto->locvars[i];
+            if (local.startpc)
+                function.locals.push_back({reg(local.reg), uint32_t(local.startpc), uint32_t(local.endpc), stringValue(local.varname)});
+        }
 
         const auto code = decode();
         if (code.empty()) fail(0, "empty function");

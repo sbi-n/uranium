@@ -449,10 +449,10 @@ void stagesAndNames()
     auto ssa = buildSSA(std::move(cfg));
     auto ast = buildAST(ssa);
     auto text = printAST(ast);
-    check(text.find("local uv_0 = 1") != std::string::npos, "captured binding should use uv_0");
-    check(text.find("local function f_0(") < text.find("local function f_1("), "nested function declaration order");
-    check(text.find("local function f_1(") < text.find("local function f_2("), "function numbering must follow printed order");
-    check(text.find("local function f_0(uv_1)") != std::string::npos, "captured parameter should share its upvalue name");
+    check(text.find("local n1 = 1") != std::string::npos, "captured numeric binding should use n1");
+    check(text.find("local function v1(") < text.find("local function v2("), "nested function declaration order");
+    check(text.find("local function v2(") < text.find("local function v3("), "function numbering must follow printed order");
+    check(text.find("local function v1(p1)") != std::string::npos, "captured parameter should retain its parameter name");
 
     auto diamond = buildSSA(buildCFG(lift(Luau::compile("local x if input then x=1 else x=2 end return x", options))));
     bool phi = false;
@@ -465,9 +465,9 @@ void stagesAndNames()
             local function inner(q) return q end return p,inner end
         local c=input print(c,c) return outer)", options));
     size_t previous = 0;
-    for (const char* declaration : {"local v_0 = input", "local function f_0(v_1)", "local v_2 = input", "local function f_1(v_3)", "local v_4 = input"})
+    for (const char* declaration : {"local _input = input", "local function v1(p1)", "local _input = input", "local function v2(p2)", "local _input2 = input"})
     {
-        auto position = ordered.find(declaration);
+        auto position = ordered.find(declaration, previous);
         check(position != std::string::npos && position >= previous, "variables must be numbered by printed declaration order");
         previous = position;
     }
@@ -479,21 +479,22 @@ void argumentAliases()
         for (int debug : {0, 2})
         {
             Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+            std::string binding = debug ? "a" : "_input";
             auto simple = decompile(Luau::compile("local a=input local b=a.aass print(a)", options));
-            check(simple.find("print(v_0)") != std::string::npos, "plain arguments should reuse the original binding");
+            check(simple.find("print(" + binding + ")") != std::string::npos, "plain arguments should reuse the original binding");
 
             auto parameter = decompile(Luau::compile(R"(local function test(a)
                 local b=a.aass print(a) print(a,a.aass)
                 if input then a={} end return a end return test)", options));
-            check(parameter.find("print(v_0)") != std::string::npos, "later parameter assignments must not force an argument copy:\n" + parameter);
-            check(parameter.find("print(v_0, v_0.aass)") != std::string::npos, "property arguments should inline beside their original receiver:\n" + parameter);
+            check(parameter.find("print(p1)") != std::string::npos, "later parameter assignments must not force an argument copy:\n" + parameter);
+            check(parameter.find("print(p1, p1.aass)") != std::string::npos, "property arguments should inline beside their original receiver:\n" + parameter);
 
             auto loop = decompile(Luau::compile("for a in values do local b=a.aass print(a,a.aass) end", options));
-            check(loop.find("print(v_0, v_0.aass)") != std::string::npos, "loop argument copies should disappear:\n" + loop);
+            check(loop.find("print(v1, v1.aass)") != std::string::npos, "loop argument copies should disappear:\n" + loop);
 
             auto captured = decompile(Luau::compile(R"(local a=input local function reader() return a end
                 local b=a.aass local copy=a print(copy) return reader)", options));
-            check(captured.find("print(uv_0)") != std::string::npos, "read-only captures should not need argument snapshots:\n" + captured);
+            check(captured.find("print(" + binding + ")") != std::string::npos, "read-only captures should not need argument snapshots:\n" + captured);
         }
 }
 
@@ -591,22 +592,22 @@ void inliningAndDebugNames()
         local amount=math.abs(-2) t.amount=amount
         local call=print local function callback() return 1 end call(callback)
         return t end return fill)", options));
-    check(output.find("local v_") == std::string::npos, "single-use operands should not leave temporary declarations:\n" + output);
-    check(output.find("v_0[v_1.key] = v_1.value") != std::string::npos, "table keys and values should be substituted");
-    check(output.find("v_0.amount = math.abs(-2)") != std::string::npos, "table stores should accept inline calls");
+    check(output.find("local v") == std::string::npos, "single-use operands should not leave temporary declarations:\n" + output);
+    check(output.find("p1[p2.key] = p2.value") != std::string::npos, "table keys and values should be substituted");
+    check(output.find("p1.amount = math.abs(-2)") != std::string::npos, "table stores should accept inline calls");
     check(output.find("print(function()") != std::string::npos, "callee and its single-use callback should inline");
     check(output.find("local function fill(") != std::string::npos, "function should retain its debugname");
 
     auto branch = decompile(Luau::compile(R"(local function choose(value,condition)
         local alias=value if condition then return alias end return 0 end return choose)", options));
-    check(branch.find("local v_") == std::string::npos, "immutable single-use aliases should inline into branches");
+    check(branch.find("local alias") == std::string::npos, "immutable single-use aliases should inline into branches");
 
     auto shared = decompile(Luau::compile(R"(local value=input return value,value)", options));
-    check(shared.find("local v_0 = input") != std::string::npos, "multiple reads must retain a shared binding");
+    check(shared.find("local value = input") != std::string::npos, "multiple reads must retain a shared binding");
 
     auto recursive = decompile(Luau::compile(R"(local function factorial(n)
         if n<=1 then return 1 end return n*factorial(n-1) end return factorial(6))", options));
-    check(recursive.find("local function factorial(") != std::string::npos && recursive.find("factorial(v_0 - 1)") != std::string::npos,
+    check(recursive.find("local function factorial(") != std::string::npos && recursive.find("factorial(p1 - 1)") != std::string::npos,
         "recursive calls must use the debugname");
 
     const char* collisionSource = R"(local function first(n) return math.abs(n) end
@@ -614,7 +615,7 @@ void inliningAndDebugNames()
     auto ir = lift(Luau::compile(collisionSource, options));
     for (auto& fn : ir.functions) if (fn.id) fn.debugname = "math";
     auto collision = printAST(buildAST(buildSSA(buildCFG(std::move(ir)))));
-    check(collision.find("local function math_1(") != std::string::npos && collision.find("local function math_2(") != std::string::npos,
+    check(collision.find("local function _math(") != std::string::npos && collision.find("local function _math2(") != std::string::npos,
         "debugnames must avoid global and local name collisions");
     check(evaluate(collision) == evaluate(collisionSource), "name collisions must not change global lookup or captured calls");
 
@@ -623,7 +624,7 @@ void inliningAndDebugNames()
         auto invalidIR = lift(Luau::compile("local function named(n) return n+1 end return named(2)", options));
         invalidIR.functions.at(1).debugname = invalid;
         auto fallback = printAST(buildAST(buildSSA(buildCFG(std::move(invalidIR)))));
-        check(fallback.find("local function f_0(") != std::string::npos, "invalid debugnames need a valid generated name");
+        check(fallback.find("local function v1(") != std::string::npos, "invalid debugnames need a valid generated name");
         check(evaluate(fallback) == evaluate("return 3"), "invalid debugname fallback must compile and execute");
     }
 }

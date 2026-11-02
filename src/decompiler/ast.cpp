@@ -78,12 +78,6 @@ bool identifier(std::string_view name)
         "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"};
     return !keywords.count(name);
 }
-bool generatedName(std::string_view name)
-{
-    size_t prefix = name.starts_with("uv_") ? 3 : name.starts_with("v_") || name.starts_with("f_") ? 2 : 0;
-    return prefix && name.size() > prefix && std::all_of(name.begin() + prefix, name.end(), [](char c) { return c >= '0' && c <= '9'; });
-}
-
 struct DisjointSet
 {
     std::vector<uint32_t> parents;
@@ -231,9 +225,20 @@ ASTSymbolId FunctionBuilder::binding(SSAValueId value)
 {
     auto root = groups.root(value);
     auto it = symbols.find(root);
-    if (it != symbols.end()) return it->second;
-    auto id = builder.newSymbol(function->id);
-    symbols.emplace(root, id); return id;
+    auto id = it != symbols.end() ? it->second : builder.newSymbol(function->id);
+    symbols.emplace(root, id);
+    auto& info = builder.ast.symbols[id];
+    const auto& origin = ssa.values[value];
+    if (!info.debugname && !info.parameter && origin.kind == SSAValue::Kind::INSTRUCTION)
+    {
+        const auto& block = ir.blocks[origin.block];
+        uint32_t pc = block.instructions[origin.instruction].pc;
+        uint32_t next = origin.instruction + 1 < block.instructions.size() ? block.instructions[origin.instruction + 1].pc : block.endpc;
+        for (const auto& local : ir.locals)
+            if (local.reg.index == origin.reg && next >= local.startpc && pc < local.endpc)
+            { info.debugname = local.debugname; break; }
+    }
+    return id;
 }
 
 ASTExpr FunctionBuilder::operand(const IROperand& op, uint32_t b, uint32_t i)
@@ -393,9 +398,10 @@ void FunctionBuilder::instruction(ASTBlock& out, uint32_t b, uint32_t i)
     case IROp::CLOSURE: case IROp::DUPCLOSURE:
     {
         auto id = dest()->symbol;
-        builder.ast.symbols[id].kind = ASTSymbol::Kind::FUNCTION;
-        if (!builder.ast.symbols[id].debugname)
-            builder.ast.symbols[id].debugname = builder.ssa.cfg.ir.functions.at(std::get<IRFunctionRef>(o[1]).ref).debugname;
+        auto& info = builder.ast.symbols[id];
+        const auto& debugname = builder.ssa.cfg.ir.functions.at(std::get<IRFunctionRef>(o[1]).ref).debugname;
+        if (debugname && (info.kind != ASTSymbol::Kind::FUNCTION || !info.debugname)) info.debugname = debugname;
+        info.kind = ASTSymbol::Kind::FUNCTION;
         std::vector<ASTSymbolId> captures;
         for (size_t n = 2; n < o.size(); ++n)
         {
@@ -1377,20 +1383,72 @@ struct Printer
     const ASTContext& ast;
     explicit Printer(const ASTContext& ast) : ast(ast)
     {
-        for (const auto& info : ast.symbols)
-            if (info.kind == ASTSymbol::Kind::FUNCTION && info.debugname && identifier(*info.debugname))
-                preferredNames.insert(*info.debugname);
         reserveNames(ast.entry->body);
+        usedNames = globalNames;
+        for (ASTSymbolId id = 0; id < ast.symbols.size(); ++id)
+            if (auto preferred = preferredName(id); !preferred.empty()) preferredNames.insert(safeName(std::move(preferred)));
     }
     std::ostringstream out;
     std::map<ASTSymbolId, std::string> names;
+    struct Value { ASTExpr expression; size_t index, count; };
+    std::map<ASTSymbolId, Value> values;
+    std::set<ASTSymbolId> numericIndices;
     std::set<std::string> preferredNames;
-    std::set<std::string> usedNames{"getfenv"};
-    uint32_t variables = 0, upvalues = 0, functions = 0;
+    std::set<std::string> globalNames{"getfenv"}, usedNames;
+    uint32_t variables = 0, parameters = 0, tables = 0, numbers = 0;
+    std::string stringName(const ASTExpr& e)
+    {
+        if (e->kind != EK::LITERAL || e->text.size() < 2 || e->text.front() != '"' || e->text.back() != '"') return {};
+        auto text = e->text.substr(1, e->text.size() - 2);
+        return identifier(text) ? text : std::string{};
+    }
+    std::string valueName(const ASTExpr& e, unsigned depth = 0)
+    {
+        if (depth > 100) return {};
+        if (e->kind == EK::GLOBAL) return identifier(e->text) ? e->text : std::string{};
+        if (e->kind == EK::INDEX) return e->text.empty() ? stringName(e->children[1]) : e->text;
+        if (e->kind == EK::SYMBOL)
+        {
+            const auto& info = ast.symbols[e->symbol];
+            if (!info.parameter && info.debugname && identifier(*info.debugname)) return *info.debugname;
+            auto found = values.find(e->symbol);
+            return found == values.end() ? std::string{} : valueName(found->second.expression, depth + 1);
+        }
+        if (e->kind != EK::CALL && e->kind != EK::METHOD_CALL) return {};
+        for (size_t i = e->children.size(); i-- > 1;)
+            if (auto text = stringName(e->children[i]); !text.empty()) return text;
+        if (e->kind == EK::CALL && e->children[0]->kind == EK::GLOBAL && e->children[0]->text == "require" && e->children.size() == 2)
+            return valueName(e->children[1], depth + 1);
+        if (e->kind == EK::METHOD_CALL)
+        {
+            if (e->text == "Clone") return "clone";
+            if (e->text.starts_with("Get") && identifier(std::string_view(e->text).substr(3))) return e->text.substr(3);
+        }
+        return {};
+    }
+    std::string preferredName(ASTSymbolId id)
+    {
+        const auto& info = ast.symbols[id];
+        if (info.parameter || numericIndices.count(id)) return {};
+        auto found = values.find(id);
+        if (found != values.end() && found->second.expression->kind == EK::TABLE) return {};
+        if (info.debugname && identifier(*info.debugname)) return *info.debugname;
+        if (found == values.end()) return {};
+        const auto& value = found->second;
+        const auto& e = value.expression;
+        if (e->kind == EK::CALL && e->children[0]->kind == EK::GLOBAL && e->children[0]->text == "pcall" && value.count == 2)
+            return value.index ? "result" : "ok";
+        return valueName(e);
+    }
+    std::string safeName(std::string text)
+    {
+        while (globalNames.count(text)) text.insert(text.begin(), '_');
+        return text;
+    }
     void reserveNames(const ASTExpr& e)
     {
         if (!e) return;
-        if (e->kind == EK::GLOBAL) usedNames.insert(e->text);
+        if (e->kind == EK::GLOBAL) globalNames.insert(e->text);
         for (const auto& child : e->children) reserveNames(child);
         for (const auto& field : e->fields) { reserveNames(field.key); reserveNames(field.value); }
         if (e->function) reserveNames(e->function->body);
@@ -1399,7 +1457,16 @@ struct Printer
     {
         for (const auto& s : body)
         {
-            if (s.kind == SK::CLASS) usedNames.insert(s.text);
+            if (s.kind == SK::CLASS) globalNames.insert(s.text);
+            if (s.kind == SK::NUMERIC_FOR) numericIndices.insert(s.names[0]);
+            if ((s.kind == SK::LOCAL || s.kind == SK::ASSIGN) && !s.rhs.empty())
+                for (size_t i = 0; i < s.lhs.size(); ++i)
+                {
+                    size_t r = std::min(i, s.rhs.size() - 1);
+                    if (i > r && !s.rhs[r]->multret) break;
+                    if (s.lhs[i]->kind == EK::SYMBOL)
+                        values.try_emplace(s.lhs[i]->symbol, Value{s.rhs[r], i - r, r + 1 == s.rhs.size() ? s.lhs.size() - r : 1});
+                }
             for (const auto& e : s.lhs) reserveNames(e);
             for (const auto& e : s.rhs) reserveNames(e);
             reserveNames(s.condition); reserveNames(s.body); reserveNames(s.alternative);
@@ -1412,18 +1479,32 @@ struct Printer
         if (it != names.end()) return it->second;
         if (!declaration) throw std::runtime_error("AST printer: symbol used before its declaration");
         const auto& info = ast.symbols.at(id);
-        std::string text;
-        if (info.kind == ASTSymbol::Kind::FUNCTION && info.debugname && identifier(*info.debugname))
+        std::string text = preferredName(id);
+        if (!text.empty())
         {
-            text = *info.debugname;
-            for (unsigned suffix = 1; usedNames.count(text) || (text != *info.debugname && preferredNames.count(text)); ++suffix)
-                text = *info.debugname + "_" + std::to_string(suffix);
+            std::string base = safeName(std::move(text));
+            text = base;
+            std::string separator = base.back() >= '0' && base.back() <= '9' ? "_" : "";
+            for (unsigned suffix = 2; usedNames.count(text) || (text != base && preferredNames.count(text)); ++suffix)
+                text = base + separator + std::to_string(suffix);
         }
-        else
+        else if (numericIndices.count(id))
         {
+            for (char c : std::string_view("ijklmnopqrstuvwxyz"))
+                if (std::string candidate(1, c); !usedNames.count(candidate) && !preferredNames.count(candidate))
+                { text = candidate; break; }
+        }
+        if (text.empty())
+        {
+            auto found = values.find(id);
+            auto e = found == values.end() ? nullptr : found->second.expression;
+            bool table = e && e->kind == EK::TABLE;
+            bool number = e && e->kind == EK::LITERAL && !e->text.empty() &&
+                (e->text.front() == '-' || (e->text.front() >= '0' && e->text.front() <= '9'));
+            auto& counter = info.parameter ? parameters : table ? tables : number ? numbers : variables;
+            std::string prefix = info.parameter ? "p" : table ? "t" : number ? "n" : "v";
             do
-                text = info.kind == ASTSymbol::Kind::FUNCTION ? "f_" + std::to_string(functions++) :
-                    info.kind == ASTSymbol::Kind::UPVALUE ? "uv_" + std::to_string(upvalues++) : "v_" + std::to_string(variables++);
+                text = prefix + std::to_string(++counter);
             while (usedNames.count(text) || preferredNames.count(text));
         }
         usedNames.insert(text);
@@ -1466,12 +1547,39 @@ struct Printer
             if (single) out << ')';
         }
     }
-    void parameters(const ASTFunction& fn)
+    void parameterList(const ASTFunction& fn)
     {
         out << '(';
         for (size_t i = 0; i < fn.parameters.size(); ++i) out << (i ? ", " : "") << name(fn.parameters[i], true);
         if (fn.isVararg) out << (fn.parameters.empty() ? "..." : ", ...");
         out << ')';
+    }
+    void functionBody(const ASTFunction& fn, unsigned depth)
+    {
+        auto outer = std::move(usedNames);
+        usedNames = globalNames;
+        std::function<void(const ASTExpr&)> captures;
+        std::function<void(const ASTBlock&)> scan;
+        captures = [&](const ASTExpr& e) {
+            if (!e) return;
+            if (e->kind == EK::SYMBOL && ast.symbols[e->symbol].owner != fn.id)
+                if (auto it = names.find(e->symbol); it != names.end()) usedNames.insert(it->second);
+            for (const auto& child : e->children) captures(child);
+            for (const auto& field : e->fields) { captures(field.key); captures(field.value); }
+            if (e->function) scan(e->function->body);
+        };
+        scan = [&](const ASTBlock& body) {
+            for (const auto& s : body)
+            {
+                for (const auto& e : s.lhs) captures(e);
+                for (const auto& e : s.rhs) captures(e);
+                captures(s.condition); scan(s.body); scan(s.alternative);
+            }
+        };
+        scan(fn.body);
+        parameterList(fn); out << '\n';
+        block(fn.body, depth + 1); indent(depth); out << "end";
+        usedNames = std::move(outer);
     }
     void expression(const ASTExpr& e, unsigned depth, int parent = 0)
     {
@@ -1483,7 +1591,7 @@ struct Printer
         case EK::LITERAL: out << e->text; break;
         case EK::SYMBOL: out << name(e->symbol); break;
         case EK::GLOBAL:
-            if (identifier(e->text) && !generatedName(e->text)) out << e->text;
+            if (identifier(e->text)) out << e->text;
             else out << "getfenv()[" << quote(e->text) << ']';
             break;
         case EK::UNARY:
@@ -1515,8 +1623,7 @@ struct Printer
             out << "if "; expression(e->children[0], depth, 1); out << " then "; expression(e->children[1], depth);
             out << " else "; expression(e->children[2], depth); break;
         case EK::FUNCTION:
-            out << "function"; parameters(*e->function); out << '\n';
-            block(e->function->body, depth + 1); indent(depth); out << "end"; break;
+            out << "function"; functionBody(*e->function, depth); break;
         case EK::TABLE:
             out << '{';
             for (size_t i = 0; i < e->fields.size(); ++i)
@@ -1544,10 +1651,12 @@ struct Printer
     void branch(const ASTStatement& s, unsigned depth, bool elseif = false)
     {
         out << (elseif ? "elseif " : "if "); expression(s.condition, depth); out << " then\n";
+        auto outer = usedNames;
         block(s.body, depth + 1);
+        usedNames = outer;
         if (s.alternative.size() == 1 && s.alternative[0].kind == SK::IF)
         { indent(depth); branch(s.alternative[0], depth, true); return; }
-        if (!s.alternative.empty()) { indent(depth); out << "else\n"; block(s.alternative, depth + 1); }
+        if (!s.alternative.empty()) { indent(depth); out << "else\n"; block(s.alternative, depth + 1); usedNames = std::move(outer); }
         indent(depth); out << "end\n";
     }
     void block(const ASTBlock& body, unsigned depth)
@@ -1564,8 +1673,7 @@ struct Printer
                 if (s.kind == SK::LOCAL && s.lhs.size() == 1 && s.rhs.size() == 1 && s.rhs[0]->kind == EK::FUNCTION)
                 {
                     out << "local function " << name(s.lhs[0]->symbol);
-                    auto& fn = *s.rhs[0]->function; parameters(fn); out << '\n';
-                    block(fn.body, depth + 1); indent(depth); out << "end\n"; break;
+                    functionBody(*s.rhs[0]->function, depth); out << '\n'; break;
                 }
                 if (s.kind == SK::LOCAL) out << "local ";
                 else if (!s.lhs.empty() && startsWithParen(s.lhs[0])) out << ';';
@@ -1580,15 +1688,27 @@ struct Printer
                 out << "return"; if (!s.rhs.empty()) { out << ' '; list(s.rhs, depth); } out << '\n'; break;
             case SK::IF: branch(s, depth); break;
             case SK::WHILE:
+            {
+                auto outer = usedNames;
                 out << "while "; expression(s.condition, depth); out << " do\n";
-                block(s.body, depth + 1); indent(depth); out << "end\n"; break;
+                block(s.body, depth + 1); indent(depth); out << "end\n";
+                usedNames = std::move(outer); break;
+            }
             case SK::REPEAT:
-                out << "repeat\n"; block(s.body, depth + 1); indent(depth); out << "until "; expression(s.condition, depth); out << '\n'; break;
+            {
+                auto outer = usedNames;
+                out << "repeat\n"; block(s.body, depth + 1); indent(depth); out << "until "; expression(s.condition, depth); out << '\n';
+                usedNames = std::move(outer); break;
+            }
             case SK::NUMERIC_FOR: case SK::GENERIC_FOR:
+            {
+                auto outer = usedNames;
                 out << "for ";
                 for (size_t i = 0; i < s.names.size(); ++i) out << (i ? ", " : "") << name(s.names[i], true);
                 out << (s.kind == SK::NUMERIC_FOR ? " = " : " in "); list(s.rhs, depth, s.kind == SK::GENERIC_FOR); out << " do\n";
-                block(s.body, depth + 1); indent(depth); out << "end\n"; break;
+                block(s.body, depth + 1); indent(depth); out << "end\n";
+                usedNames = std::move(outer); break;
+            }
             case SK::BREAK: out << "break\n"; break;
             case SK::CONTINUE: out << "continue\n"; break;
             case SK::CLASS:
@@ -1603,8 +1723,7 @@ struct Printer
                 indent(depth); expression(s.lhs[0], depth); out << " = " << s.text << '\n'; break;
             case SK::METHOD:
                 out << "function " << s.text;
-                parameters(*s.rhs[0]->function); out << '\n';
-                block(s.rhs[0]->function->body, depth + 1); indent(depth); out << "end\n"; break;
+                functionBody(*s.rhs[0]->function, depth); out << '\n'; break;
             case SK::SETLIST:
                 for (size_t i = 0; i < s.rhs.size(); ++i)
                 {

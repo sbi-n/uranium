@@ -118,13 +118,22 @@ std::string source = printAST(ast);
   Reference captures remain shared; value captures remain snapshots. Experimental class
   instructions reconstruct class declarations and require the corresponding bundled Luau flags.
 
-Generated locals and parameters use `v_0`, `v_1`, ...; captured bindings use `uv_0`,
-`uv_1`, .... Local functions use their bytecode `debugname` when it is a valid identifier,
-and otherwise use `f_0`, `f_1`, .... Conflicting debug names receive a numeric suffix;
-generated names skip names reserved by debug information, globals, and classes. Each
-counter is independent and starts at zero for the output chunk. Numbers follow **printed
-declaration order**, including nested function bodies, rather than registers or prototype
-IDs. Captured functions and recursive self references share the function's chosen name.
+Bindings use [Lua Expert v2](https://blog.lua.expert/posts/v2/)-style value-based names.
+String-key accesses use the property name (`hello` for both `t.hello` and `t["hello"]`).
+Calls use their last valid identifier string argument, including service/child lookups,
+attribute lookups, and `Instance.new`. `require` uses the module binding or property;
+`GetChildren()` becomes `Children`, `Clone()` becomes `clone`, and two-result `pcall`
+assignments use `ok` and `result`. Valid local and function debug names take precedence
+when available, except for parameters, table constructors, and numeric loop indices.
+
+Parameters use `p1`, `p2`, ...; tables use `t1`, `t2`, ...; numeric literals use `n1`,
+`n2`, ...; other unnamed bindings and functions use `v1`, `v2`, .... These counters are
+independent, start at one for the output chunk, and follow printed declaration order,
+including nested function bodies. Numeric loops use `i`, `j`, ... according to nesting.
+Repeated names become `hello2`, `hello3`, ...; names ending in a digit use an underscore
+(`hello2_2`). Global-name conflicts receive a leading underscore. Generated names skip
+reserved semantic names, globals, and classes. Names can be reused in separate lexical
+scopes; captures and recursive references retain their binding's chosen name.
 Globals, property/method names, and runtime class names retain their semantic names.
 
 Single-use temporary values are substituted directly into arguments, table keys/values,
@@ -145,17 +154,17 @@ closures defined outside a loop retain their identity across iterations.
 For example:
 
 ```lua
-local uv_0 = 1
-local function add(v_0)
-    uv_0 = uv_0 + v_0
-    return uv_0
+local n1 = 1
+local function add(p1)
+    n1 = n1 + p1
+    return n1
 end
 return add(2)
 ```
 
 The decompiler recovers source structure from compiler-produced bytecode. Comments,
-type annotations, original local names, and code removed or transformed by compiler
-optimizations cannot be recovered exactly. Unrepresentable control flow is reported as
+type annotations, local names absent from debug information, and code removed or transformed
+by compiler optimizations cannot be recovered exactly. Unrepresentable control flow is reported as
 an error instead of emitting incomplete source. Tests recompile and execute recovered
 chunks, compare results with the originals, and cover optimization levels 0–2 with and
 without debug information.
