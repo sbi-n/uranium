@@ -14,8 +14,8 @@ Extract the `.tar.gz` (Linux/macOS) or `.zip` (Windows) archive and run `uranium
 Linux binaries target Ubuntu 24.04 or newer compatible systems; macOS binaries target macOS 15 or newer.
 
 Push a version tag, such as `v1.0.0`, to build, test, and publish all three archives
-and `SHA256SUMS` automatically. Pushes to `main`, pull requests, and manual workflow
-runs also build and test all three platforms and upload archives as Actions artifacts.
+and `SHA256SUMS` automatically. Pushes to `main` and pull requests also build and
+test all three platforms and upload archives as Actions artifacts.
 
 ## Build
 

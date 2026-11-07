@@ -1,6 +1,7 @@
 #include "ir.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -173,9 +174,12 @@ struct FunctionLifter
         case LUA_TSTRING: return IRConstantString{stringValue(tsvalue(&v))};
         case LUA_TVECTOR:
         {
+            // Float vector components span Value::v and TValue::extra.
+            LUA_VECTOR_TYPE components[LUA_VECTOR_SIZE];
+            std::memcpy(components, condvectordouble(vvalue(&v), &v), sizeof(components));
             IRConstantVector result;
-            for (int i = 0; i < LUA_VECTOR_SIZE; ++i)
-                result.value.push_back(vvalue(&v)[i]);
+            for (auto component : components)
+                result.value.push_back(component);
             return result;
         }
         case LUA_TFUNCTION:
