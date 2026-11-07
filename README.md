@@ -8,11 +8,14 @@ a Luau bytecode disassembler/decompiler
 
 ## Quick Start
 
-Download releases
+Download the CLI from [GitHub Releases](https://github.com/sbi-n/uranium/releases).
+Builds are available for `windows-x86_64`, `macos-aarch64`, and `linux-x86_64`.
+Extract the `.tar.gz` (Linux/macOS) or `.zip` (Windows) archive and run `uranium --help`.
+Linux binaries target Ubuntu 24.04 or newer compatible systems; macOS binaries target macOS 15 or newer.
 
-- Luau compiled ( using wasm and spider )
-- CLI
-- Archive
+Push a version tag, such as `v1.0.0`, to build, test, and publish all three archives
+and `SHA256SUMS` automatically. Pushes to `main`, pull requests, and manual workflow
+runs also build and test all three platforms and upload archives as Actions artifacts.
 
 ## Build
 
