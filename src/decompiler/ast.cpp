@@ -1,11 +1,11 @@
 #include "ast.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <functional>
 #include <iomanip>
 #include <limits>
-#include <locale>
 #include <map>
 #include <numeric>
 #include <set>
@@ -64,10 +64,9 @@ std::string number(double value)
     if (std::isnan(value)) return "(0 / 0)";
     if (std::isinf(value)) return value < 0 ? "(-1 / 0)" : "(1 / 0)";
     if (value == 0 && std::signbit(value)) return "-0.0";
-    std::ostringstream out;
-    out.imbue(std::locale::classic());
-    out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
-    return out.str();
+    char text[64];
+    auto result = std::to_chars(text, text + sizeof(text), value);
+    return {text, result.ptr};
 }
 bool identifier(std::string_view name)
 {
@@ -1027,16 +1026,31 @@ bool inlineUse(ASTStatement& s, ASTSymbolId id, const ASTExpr& value, const ASTC
     return false;
 }
 
+void removeStatements(ASTBlock& block, const std::vector<bool>& removed)
+{
+    size_t index = 0;
+    std::erase_if(block, [&](const ASTStatement&) { return removed[index++]; });
+}
+
+bool passiveConstruction(const ASTExpr& e, const ASTContext& ast)
+{
+    if (!e || e->kind != EK::TABLE) return passive(e, ast);
+    for (const auto& field : e->fields)
+        if (!passiveConstruction(field.key, ast) || !passiveConstruction(field.value, ast)) return false;
+    return true;
+}
+
 bool foldTables(ASTBlock& block, ASTContext& ast)
 {
     bool changed = false;
+    std::vector<bool> removed(block.size());
     for (size_t i = 0; i < block.size(); ++i)
     {
         auto& init = block[i];
         if (init.kind != SK::ASSIGN || init.lhs.size() != 1 || init.lhs[0]->kind != EK::SYMBOL || init.rhs.size() != 1 || init.rhs[0]->kind != EK::TABLE) continue;
         auto id = init.lhs[0]->symbol;
-        if (ast.symbols[id].captured) continue;
         auto table = init.rhs[0];
+        if (ast.symbols[id].captured && !passiveConstruction(table, ast)) continue;
         std::set<ASTSymbolId> dependencies;
         auto record = [&](ASTExpr& e) { if (e->kind == EK::SYMBOL) dependencies.insert(e->symbol); };
         for (auto& f : table->fields) { eachExpr(f.key, record, false); eachExpr(f.value, record, false); }
@@ -1047,13 +1061,29 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
             bool writesTable = s.lhs.size() == 1 &&
                 ((s.kind == SK::SETLIST && s.lhs[0]->kind == EK::SYMBOL && s.lhs[0]->symbol == id) ||
                  (s.kind == SK::ASSIGN && s.lhs[0]->kind == EK::INDEX && s.lhs[0]->children[0]->kind == EK::SYMBOL && s.lhs[0]->children[0]->symbol == id));
+            if (ast.symbols[id].captured)
+            {
+                // Moving a shared binding is safe only while no user code can
+                // observe it. A callback capturing the table also ends the region.
+                bool safe = true;
+                auto check = [&](ASTExpr& e) {
+                    safe &= passiveConstruction(e, ast);
+                    eachExpr(e, [&](ASTExpr& value) {
+                        if (value->kind == EK::SYMBOL && value->symbol == id) safe = false;
+                    });
+                };
+                for (auto& rhs : s.rhs) check(rhs);
+                for (auto& lhs : s.lhs)
+                    if (lhs->kind == EK::INDEX && lhs->children.size() > 1) check(lhs->children[1]);
+                if (!safe) break;
+            }
             if (!writesTable)
             {
                 bool conflict = directUses(s, id) != 0;
                 for (const auto& lhs : s.lhs)
                     conflict |= lhs->kind != EK::SYMBOL || lhs->symbol == id || dependencies.count(lhs->symbol);
-                // Captured tables are excluded above. Creating an unrelated
-                // callback does not expose this table or execute the callback.
+                // Creating an unrelated callback does not expose this table or
+                // execute the callback.
                 for (auto dependency : dependencies)
                     if (ast.symbols[dependency].captured)
                         for (auto& rhs : s.rhs)
@@ -1063,8 +1093,12 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
                     for (const auto& e : {field.key, field.value})
                         if (e && e->kind != EK::LITERAL && e->kind != EK::SYMBOL) fieldEffects = true;
                 if (fieldEffects)
+                {
+                    for (const auto& lhs : s.lhs)
+                        if (lhs->kind == EK::SYMBOL && ast.symbols[lhs->symbol].captured) conflict = true;
                     for (const auto& rhs : s.rhs)
                         if (rhs->kind != EK::LITERAL && !(rhs->kind == EK::SYMBOL && !ast.symbols[rhs->symbol].captured)) conflict = true;
+                }
                 if (conflict) break;
                 continue;
             }
@@ -1106,13 +1140,12 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
             }
             // Place construction after the value computations, at the original
             // store. No table reference escapes across the moved allocation.
-            ASTStatement moved = std::move(block[i]);
-            block.erase(block.begin() + i);
-            --j;
-            block[j] = std::move(moved);
+            block[j] = std::move(block[i]);
+            removed[i] = true;
             i = j; changed = true;
         }
     }
+    if (changed) removeStatements(block, removed);
     return changed;
 }
 
@@ -1210,18 +1243,19 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
         eachExpr(s.condition, nested, false);
     }
     changed |= foldTables(block, ast);
+    std::vector<bool> removed(block.size());
     for (size_t i = 0; i < block.size(); ++i)
     {
         auto& s = block[i];
         if (s.kind != SK::ASSIGN || s.lhs.size() != 1 || s.lhs[0]->kind != EK::SYMBOL || s.rhs.size() != 1) continue;
         auto id = s.lhs[0]->symbol;
         if (s.rhs[0]->kind == EK::SYMBOL && s.rhs[0]->symbol == id)
-        { block.erase(block.begin() + i--); changed = true; continue; }
+        { removed[i] = true; changed = true; continue; }
         const auto& info = ast.symbols[id];
         if (info.captured || info.parameter || info.loopVariable || uses.writes[id] != 1) continue;
         if (info.kind == ASTSymbol::Kind::FUNCTION && s.rhs[0]->kind != EK::FUNCTION) continue;
         if (uses.reads[id] == 0 && (stable(s.rhs[0], ast, uses) || s.rhs[0]->kind == EK::VARARGS))
-        { block.erase(block.begin() + i--); changed = true; continue; }
+        { removed[i] = true; changed = true; continue; }
         if (uses.reads[id] == 0 && (s.rhs[0]->kind == EK::CALL || s.rhs[0]->kind == EK::METHOD_CALL))
         { s.kind = SK::EXPRESSION; s.lhs.clear(); changed = true; continue; }
         if (uses.reads[id] != 1) continue;
@@ -1229,7 +1263,7 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
         {
             if (inlineUse(block[j], id, s.rhs[0], ast, uses))
             {
-                block.erase(block.begin() + i--); changed = true; break;
+                removed[i] = true; changed = true; break;
             }
             // Constructing a callback does not execute its body. Its value
             // captures are explicit snapshots, so it can move past effects
@@ -1237,6 +1271,7 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
             if (s.rhs[0]->kind != EK::FUNCTION && !stable(s.rhs[0], ast, uses) && !canMovePast(block[j], s.rhs[0], ast)) break;
         }
     }
+    removeStatements(block, removed);
     // Merge iterator triplets back into their originating multiple-result call.
     for (size_t i = 0; i + 1 < block.size(); ++i)
     {
@@ -1625,26 +1660,36 @@ struct Printer
         case EK::FUNCTION:
             out << "function"; functionBody(*e->function, depth); break;
         case EK::TABLE:
+        {
+            bool multiline = e->fields.size() > 3 || std::any_of(e->fields.begin(), e->fields.end(), [](const ASTTableField& field) {
+                return field.value->kind == EK::FUNCTION || (field.value->kind == EK::TABLE && !field.value->fields.empty());
+            });
+            unsigned fieldDepth = depth + (multiline ? 1 : 0);
             out << '{';
+            if (multiline) out << '\n';
             for (size_t i = 0; i < e->fields.size(); ++i)
             {
-                if (i) out << ", ";
+                if (multiline) indent(fieldDepth);
+                else if (i) out << ", ";
                 const auto& field = e->fields[i];
                 if (field.key)
                 {
                     auto& key = field.key;
                     if (key->kind == EK::LITERAL && key->text.size() >= 2 && key->text.front() == '"' && identifier(std::string_view(key->text).substr(1, key->text.size() - 2)))
                         out << key->text.substr(1, key->text.size() - 2);
-                    else { out << '['; expression(key, depth); out << ']'; }
+                    else { out << '['; expression(key, fieldDepth); out << ']'; }
                     out << " = ";
                 }
                 bool single = !field.key && i + 1 == e->fields.size() && !field.value->multret &&
                     (field.value->kind == EK::CALL || field.value->kind == EK::METHOD_CALL || field.value->kind == EK::VARARGS);
                 if (single) out << '(';
-                expression(field.value, depth);
+                expression(field.value, fieldDepth);
                 if (single) out << ')';
+                if (multiline) out << ",\n";
             }
+            if (multiline) indent(depth);
             out << '}'; break;
+        }
         }
         if (parens) out << ')';
     }
@@ -1661,8 +1706,12 @@ struct Printer
     }
     void block(const ASTBlock& body, unsigned depth)
     {
+        bool first = true, previousFunction = false;
         for (const auto& s : body)
         {
+            bool function = s.kind == SK::METHOD || (s.kind == SK::LOCAL && s.lhs.size() == 1 && s.rhs.size() == 1 && s.rhs[0]->kind == EK::FUNCTION);
+            if (!first && (function || previousFunction)) out << '\n';
+            first = false; previousFunction = function;
             indent(depth);
             switch (s.kind)
             {
