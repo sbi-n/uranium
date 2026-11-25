@@ -29,9 +29,6 @@ FetchContent_Declare(luau
 )
 FetchContent_MakeAvailable(luau)
 
-# Release archives bundle the Luau license next to the binary.
-configure_file(${luau_SOURCE_DIR}/LICENSE.txt ${CMAKE_BINARY_DIR}/LUAU-LICENSE.txt COPYONLY)
-
 add_library(uranium_ir src/decompiler/ir.cpp)
 target_include_directories(uranium_ir PUBLIC src/decompiler)
 target_link_libraries(uranium_ir PRIVATE Luau.Common Luau.VM Luau.VM.Internals)
