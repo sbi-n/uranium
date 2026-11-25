@@ -1,8 +1,6 @@
 #include "ssa.h"
 
 #include <algorithm>
-#include <functional>
-#include <set>
 #include <stdexcept>
 
 namespace
@@ -46,7 +44,7 @@ Effects effects(const IRInstruction& insn, uint16_t stack)
         break;
     }
     case IROp::SETGLOBAL: case IROp::SETUPVAL: case IROp::SETTABLE: case IROp::SETLIST:
-    case IROp::NEWCLASSMEMBER: case IROp::BRANCH: case IROp::RETURN:
+    case IROp::BRANCH: case IROp::RETURN:
         for (const auto& op : o) operand(op);
         break;
     default:
@@ -135,7 +133,8 @@ SSAFunction analyze(const IRFunction& ir, const CFGFunction& cfg)
             children[cfg.blocks[b].immediateDominator].push_back(b);
     std::vector<std::vector<SSAValueId>> stacks(stack);
     for (uint16_t r = 0; r < stack; ++r) stacks[r].push_back(result.entryValues[r]);
-    std::function<void(uint32_t)> rename = [&](uint32_t b) {
+    // Renames block `b`; returns the registers whose definitions it pushed.
+    auto rename = [&](uint32_t b) {
         std::vector<uint16_t> pushed;
         auto push = [&](uint16_t r, SSAValueId v) { stacks[r].push_back(v); pushed.push_back(r); };
         for (auto& phi : result.blocks[b].phis) push(phi.reg, phi.result);
@@ -155,10 +154,25 @@ SSAFunction analyze(const IRFunction& ir, const CFGFunction& cfg)
         }
         for (auto s : cfg.blocks[b].successors)
             for (auto& phi : result.blocks[s].phis) phi.inputs.emplace_back(b, stacks[phi.reg].back());
-        for (auto child : children[b]) rename(child);
-        for (auto it = pushed.rbegin(); it != pushed.rend(); ++it) stacks[*it].pop_back();
+        return pushed;
     };
-    rename(0);
+    // Preorder walk of the dominator tree with an explicit stack: a long
+    // function's tree is about as deep as its statement count.
+    struct Visit { uint32_t block; size_t next; std::vector<uint16_t> pushed; };
+    std::vector<Visit> walk;
+    walk.push_back({0, 0, rename(0)});
+    while (!walk.empty())
+    {
+        auto& visit = walk.back();
+        if (visit.next < children[visit.block].size())
+        {
+            uint32_t child = children[visit.block][visit.next++];
+            walk.push_back({child, 0, rename(child)});
+            continue;
+        }
+        for (auto it = visit.pushed.rbegin(); it != visit.pushed.rend(); ++it) stacks[*it].pop_back();
+        walk.pop_back();
+    }
     for (auto& block : result.blocks)
         for (auto& phi : block.phis) std::sort(phi.inputs.begin(), phi.inputs.end());
     return result;

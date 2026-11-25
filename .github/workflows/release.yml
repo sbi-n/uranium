@@ -33,7 +33,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
           persist-credentials: false
 
       - uses: actions/setup-python@v7
@@ -62,8 +61,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist package
-          cp build/uranium README.md package/
-          cp extern/luau/LICENSE.txt package/LUAU-LICENSE.txt
+          cp build/uranium README.md build/LUAU-LICENSE.txt package/
           COPYFILE_DISABLE=1 tar -czf "dist/uranium-${{ matrix.platform }}.tar.gz" -C package .
 
       - name: Package (Windows)
@@ -71,8 +69,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist, package
-          Copy-Item build/Release/uranium.exe, README.md package/
-          Copy-Item extern/luau/LICENSE.txt package/LUAU-LICENSE.txt
+          Copy-Item build/Release/uranium.exe, README.md, build/LUAU-LICENSE.txt package/
           Compress-Archive -Path package/* -DestinationPath "dist/uranium-${{ matrix.platform }}.zip"
 
       - uses: actions/upload-artifact@v7

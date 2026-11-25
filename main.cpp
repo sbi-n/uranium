@@ -4,6 +4,11 @@
 #include <iterator>
 #include <stdexcept>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 #include "Luau/Compiler.h"
 #include "src/decompiler/decompiler.h"
 #include "src/decompiler/ir.h"
@@ -32,7 +37,14 @@ int main(int argc, char** argv)
         }
         if (path.empty()) throw std::runtime_error("missing input file; use --help");
         std::string input;
-        if (path == "-") input.assign(std::istreambuf_iterator<char>(std::cin), {});
+        if (path == "-")
+        {
+#ifdef _WIN32
+            // Bytecode is binary: text mode would translate CRLF and stop at 0x1A.
+            _setmode(_fileno(stdin), _O_BINARY);
+#endif
+            input.assign(std::istreambuf_iterator<char>(std::cin), {});
+        }
         else
         {
             std::ifstream file(path, std::ios::binary);

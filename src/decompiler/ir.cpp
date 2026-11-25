@@ -1,4 +1,5 @@
 #include "ir.h"
+#include "text.h"
 
 #include <algorithm>
 #include <cstring>
@@ -6,7 +7,6 @@
 #include <limits>
 #include <locale>
 #include <memory>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -26,30 +26,6 @@ std::string stringValue(const TString* value)
     return {getstr(value), value->len};
 }
 
-std::string quote(std::string_view value)
-{
-    std::ostringstream out;
-    out << '"';
-    for (unsigned char c : value)
-    {
-        switch (c)
-        {
-        case '"': out << "\\\""; break;
-        case '\\': out << "\\\\"; break;
-        case '\n': out << "\\n"; break;
-        case '\r': out << "\\r"; break;
-        case '\t': out << "\\t"; break;
-        default:
-            if (c < 32 || c == 127)
-                out << '\\' << std::setfill('0') << std::setw(3) << unsigned(c);
-            else
-                out << c;
-        }
-    }
-    out << '"';
-    return out.str();
-}
-
 const char* opName(IROp op)
 {
     static constexpr const char* names[] = {
@@ -57,9 +33,9 @@ const char* opName(IROp op)
         "CONCAT", "NOT", "MINUS", "LENGTH", "GETGLOBAL", "SETGLOBAL", "GETUPVAL", "SETUPVAL",
         "CLOSEUPVALS", "GETIMPORT", "GETTABLE", "SETTABLE", "NEWTABLE", "DUPTABLE", "SETLIST",
         "CLOSURE", "DUPCLOSURE", "NAMECALL", "CALL", "VARARGS", "JUMP", "BRANCH", "RETURN",
-        "FORNPREP", "FORNLOOP", "FORGPREP", "FORGLOOP", "NEWCLASS", "NEWCLASSMEMBER",
+        "FORNPREP", "FORNLOOP", "FORGPREP", "FORGLOOP",
     };
-    static_assert(std::size(names) == size_t(IROp::NEWCLASSMEMBER) + 1);
+    static_assert(std::size(names) == size_t(IROp::FORGLOOP) + 1);
     return names[size_t(op)];
 }
 
@@ -75,7 +51,6 @@ std::string operandText(const IROperand& operand)
         else if constexpr (std::is_same_v<T, IRBlockRef>) out << 'b' << value.ref;
         else if constexpr (std::is_same_v<T, IRFunctionRef>) out << 'f' << value.ref;
         else if constexpr (std::is_same_v<T, IRTableRef>) out << 't' << value.ref;
-        else if constexpr (std::is_same_v<T, IRClassRef>) out << 'c' << value.ref;
         else if constexpr (std::is_same_v<T, IRImmediate>) out << '#' << value.value;
         else if constexpr (std::is_same_v<T, IRRegisterRange>)
         {
@@ -96,7 +71,6 @@ std::string operandText(const IROperand& operand)
         else if constexpr (std::is_same_v<T, IRConstantNil>) out << "nil";
         else if constexpr (std::is_same_v<T, IRConstantBool>) out << (value.value ? "true" : "false");
         else if constexpr (std::is_same_v<T, IRConstantNumber>) out << value.value;
-        else if constexpr (std::is_same_v<T, IRConstantInteger>) out << value.value << 'i';
         else if constexpr (std::is_same_v<T, IRConstantString>) out << quote(value.value);
         else if constexpr (std::is_same_v<T, IRConstantVector>)
         {
@@ -128,7 +102,6 @@ struct FunctionLifter
     const FunctionIds& ids;
     IRFunction function{};
     std::unordered_map<const LuaTable*, uint32_t> tableIds{};
-    std::unordered_map<const LuauClass*, uint32_t> classIds{};
 
     [[noreturn]] void fail(uint32_t pc, const std::string& message) const
     {
@@ -170,7 +143,6 @@ struct FunctionLifter
         case LUA_TNIL: return IRConstantNil{};
         case LUA_TBOOLEAN: return IRConstantBool{bool(bvalue(&v))};
         case LUA_TNUMBER: return IRConstantNumber{nvalue(&v)};
-        case LUA_TINTEGER: return IRConstantInteger{lvalue(&v)};
         case LUA_TSTRING: return IRConstantString{stringValue(tsvalue(&v))};
         case LUA_TVECTOR:
         {
@@ -192,37 +164,30 @@ struct FunctionLifter
             uint32_t id = it->second;
             if (!inserted) return IRTableRef{id};
             function.tables.emplace_back();
-            IRTable result;
+            // Hash order depends on the VM; order entries by their key text so
+            // that dumps and reconstructed constructors are deterministic.
+            std::vector<std::pair<std::string, std::pair<IROperand, IROperand>>> entries;
             for (int i = 0; i < table->sizearray; ++i)
                 if (!ttisnil(&table->array[i]))
-                    result.entries.emplace_back(IRConstantNumber{double(i + 1)}, value(table->array[i]));
+                {
+                    IROperand key = IRConstantNumber{double(i + 1)};
+                    entries.emplace_back(operandText(key), std::pair{std::move(key), value(table->array[i])});
+                }
             for (int i = 0; i < sizenode(table); ++i)
             {
                 const LuaNode& node = table->node[i];
                 if (ttisnil(&node.val)) continue;
-                TValue key;
-                getnodekey(state, &key, &node);
-                IROperand k = value(key);
-                result.entries.emplace_back(std::move(k), value(node.val));
+                TValue keyValue;
+                getnodekey(state, &keyValue, &node);
+                IROperand key = value(keyValue);
+                entries.emplace_back(operandText(key), std::pair{std::move(key), value(node.val)});
             }
-            std::sort(result.entries.begin(), result.entries.end(), [](const auto& a, const auto& b) {
-                return operandText(a.first) < operandText(b.first);
-            });
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            IRTable result;
+            result.entries.reserve(entries.size());
+            for (auto& entry : entries) result.entries.push_back(std::move(entry.second));
             function.tables[id] = std::move(result);
             return IRTableRef{id};
-        }
-        case LUA_TCLASS:
-        {
-            const LuauClass* shape = classvalue(&v);
-            auto [it, inserted] = classIds.emplace(shape, uint32_t(function.classes.size()));
-            if (inserted)
-            {
-                IRClass result{stringValue(shape->name), {}, {}};
-                for (uint32_t i = 0; i < shape->numberofallmembers; ++i)
-                    (i < shape->numberofinstancemembers ? result.fields : result.methods).push_back(stringValue(shape->offsettomember[i]));
-                function.classes.push_back(std::move(result));
-            }
-            return IRClassRef{it->second};
         }
         }
         throw std::runtime_error("unsupported constant type " + std::to_string(ttype(&v)));
@@ -277,6 +242,8 @@ struct FunctionLifter
         function.maxstacksize = proto->maxstacksize;
         function.upvalueCount = proto->nups;
         function.isVararg = proto->is_vararg != 0;
+        // The entry proto's LPF_NATIVE_FUNCTION only reports that some child is native.
+        function.native = function.id != 0 && (proto->flags & LPF_NATIVE_FUNCTION);
         for (unsigned i = 0; i < proto->numparams; ++i)
         {
             IRParameter parameter{reg(i), std::nullopt};
@@ -300,39 +267,41 @@ struct FunctionLifter
 
         const auto code = decode();
         if (code.empty()) fail(0, "empty function");
-        std::set<uint32_t> starts;
-        std::set<uint32_t> leaders{0};
+        const auto size = uint32_t(proto->sizecode);
+        std::vector<bool> starts(size), leaders(size);
+        leaders[0] = true;
         auto hasTarget = [](const Decoded& insn) {
             return Luau::isJumpD(insn.op) || insn.op == LOP_JUMPX || (insn.op == LOP_LOADB && LUAU_INSN_C(insn.word));
         };
         for (const auto& insn : code)
         {
-            starts.insert(insn.pc);
+            starts[insn.pc] = true;
             if (hasTarget(insn))
             {
                 int target = Luau::getJumpTarget(insn.word, insn.pc);
                 if (target < 0 || target >= proto->sizecode) fail(insn.pc, "jump target out of range");
-                leaders.insert(uint32_t(target));
+                leaders[target] = true;
             }
-            if ((hasTarget(insn) || insn.op == LOP_RETURN) && insn.pc + insn.length < uint32_t(proto->sizecode))
-                leaders.insert(insn.pc + insn.length);
+            if ((hasTarget(insn) || insn.op == LOP_RETURN) && insn.pc + insn.length < size)
+                leaders[insn.pc + insn.length] = true;
         }
-        std::unordered_map<uint32_t, uint32_t> blockIds;
-        for (uint32_t pc : leaders)
+        constexpr uint32_t noBlock = UINT32_MAX;
+        std::vector<uint32_t> blockIds(size, noBlock);
+        for (uint32_t pc = 0; pc < size; ++pc)
         {
-            if (!starts.count(pc)) fail(pc, "jump into AUX or CAPTURE data");
+            if (!leaders[pc]) continue;
+            if (!starts[pc]) fail(pc, "jump into AUX or CAPTURE data");
             uint32_t id = uint32_t(function.blocks.size());
-            blockIds.emplace(pc, id);
-            function.blocks.push_back({id, pc, uint32_t(proto->sizecode), {}});
+            blockIds[pc] = id;
+            function.blocks.push_back({id, pc, size, {}});
             if (id) function.blocks[id - 1].endpc = pc;
         }
         auto blockRef = [&](uint32_t pc) -> IRBlockRef {
-            auto it = blockIds.find(pc);
-            if (it == blockIds.end()) fail(pc, "missing successor block");
-            return {it->second};
+            if (pc >= size || blockIds[pc] == noBlock) fail(pc, "missing successor block");
+            return {blockIds[pc]};
         };
 
-        std::set<uint32_t> fastcalls;
+        std::vector<bool> fastcalls(size);
         size_t blockIndex = 0;
         for (const auto& insn : code)
         {
@@ -365,7 +334,7 @@ struct FunctionLifter
             // callee evaluation order when reconstructing the call expression.
             case LOP_FASTCALL: case LOP_FASTCALL1: case LOP_FASTCALL2:
             case LOP_FASTCALL2K: case LOP_FASTCALL3: case LOP_FASTPCALL:
-                fastcalls.insert(pc + 1 + c);
+                if (pc + 1 + c < size) fastcalls[pc + 1 + c] = true;
                 break;
             case LOP_LOADNIL: emit(IROp::MOVE, {reg(a), IRConstantNil{}}); break;
             case LOP_LOADB:
@@ -422,7 +391,7 @@ struct FunctionLifter
                 emit(IROp::NAMECALL, {reg(a), reg(b), k(op == LOP_NAMECALLUDATA ? aux & 0xffff : aux)});
                 break;
             case LOP_CALL: case LOP_CALLFB:
-                emit(IROp::CALL, {range(a, int(c) - 1), reg(a), range(a + 1, int(b) - 1)}).argumentsBeforeCallee = fastcalls.count(pc) != 0;
+                emit(IROp::CALL, {range(a, int(c) - 1), reg(a), range(a + 1, int(b) - 1)}).argumentsBeforeCallee = fastcalls[pc];
                 break;
             case LOP_GETVARARGS: emit(IROp::VARARGS, {range(a, int(b) - 1)}); break;
             case LOP_RETURN:
@@ -483,10 +452,9 @@ struct FunctionLifter
                 terminated = true;
                 break;
             case LOP_CMPPROTO: branch(IRCondition::PROTO_MISMATCH, {reg(a), IRImmediate{aux}}); break;
-            case LOP_NEWCLASS:
-                emit(IROp::NEWCLASS, {reg(a), k(aux), b == 255 ? IROperand{IRConstantNil{}} : IROperand{reg(b)}, IRConstantBool{bool(c & 1)}});
-                break;
-            case LOP_NEWCLASSMEMBER: emit(IROp::NEWCLASSMEMBER, {reg(a), k(aux), reg(c)}); break;
+            case LOP_NEWCLASS: case LOP_NEWCLASSMEMBER: case LOP_CONSTRUCT: case LOP_FINCONSTRUCT:
+            case LOP_GETPRIVATEFIELD: case LOP_SETPRIVATEFIELD:
+                fail(pc, "experimental class bytecode is not supported");
             case LOP_BREAK: case LOP_NATIVECALL: case LOP_CAPTURE: case LOP__COUNT:
                 fail(pc, "unexpected runtime opcode or standalone CAPTURE");
             default:
@@ -494,7 +462,7 @@ struct FunctionLifter
             }
             if (next == block.endpc && !terminated)
             {
-                if (next == uint32_t(proto->sizecode)) fail(pc, "function falls off the end");
+                if (next == size) fail(pc, "function falls off the end");
                 emit(IROp::JUMP, {blockRef(next)});
             }
         }
@@ -531,6 +499,8 @@ IRContext lift(std::string_view bytecode)
             if (ttisfunction(&proto->k[j]) && !clvalue(&proto->k[j])->isC) add(clvalue(&proto->k[j])->l.p);
     }
     IRContext context;
+    context.nativeModule = protos[0]->flags & LPF_NATIVE_MODULE;
+    context.functions.reserve(protos.size());
     for (const Proto* proto : protos)
         context.functions.push_back(FunctionLifter{state.get(), proto, ids}.run());
     return context;
@@ -552,7 +522,10 @@ std::string dump(const IRContext& context)
             if (parameter.debugname) out << ':' << quote(*parameter.debugname);
         }
         if (function.isVararg) out << (function.parameters.empty() ? "..." : ", ...");
-        out << ") [stack=" << unsigned(function.maxstacksize) << ", upvalues=" << unsigned(function.upvalueCount) << "]\n";
+        out << ") [stack=" << unsigned(function.maxstacksize) << ", upvalues=" << unsigned(function.upvalueCount);
+        if (function.native) out << ", native";
+        if (!function.id && context.nativeModule) out << ", native module";
+        out << "]\n";
         for (size_t i = 0; i < function.tables.size(); ++i)
         {
             out << "  t" << i << " = {";
@@ -560,14 +533,6 @@ std::string dump(const IRContext& context)
             for (size_t j = 0; j < entries.size(); ++j)
                 out << (j ? ", " : "") << '[' << operandText(entries[j].first) << "] = " << operandText(entries[j].second);
             out << "}\n";
-        }
-        for (size_t i = 0; i < function.classes.size(); ++i)
-        {
-            const auto& shape = function.classes[i];
-            out << "  c" << i << " = class " << quote(shape.name) << " {";
-            for (const auto& field : shape.fields) out << " field " << quote(field);
-            for (const auto& method : shape.methods) out << " method " << quote(method);
-            out << " }\n";
         }
         for (const auto& block : function.blocks)
         {

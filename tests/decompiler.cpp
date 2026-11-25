@@ -13,10 +13,6 @@
 #include <sstream>
 #include <stdexcept>
 
-LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
-LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
-LUAU_FASTFLAG(LuauIntegerType2)
-
 namespace
 {
 void check(bool value, const std::string& message) { if (!value) throw std::runtime_error(message); }
@@ -45,7 +41,6 @@ std::string evaluate(const std::string& source, const Luau::CompileOptions& opti
             out << length << ':' << std::string(text, length);
         }
         else if (lua_type(L, i) == LUA_TNUMBER) out << lua_tonumber(L, i);
-        else if (lua_type(L, i) == LUA_TINTEGER) out << lua_tointeger64(L, i, nullptr);
         else if (lua_type(L, i) == LUA_TBOOLEAN) out << lua_toboolean(L, i);
         else check(lua_isnil(L, i), "test should return primitive results");
         out << '|';
@@ -250,14 +245,6 @@ const Case cases[] = {
     {"branch closure", R"(local function make(c) local f if c then local x=3 f=function() return x end else local x=7 f=function() return x end end return f() end return make(true),make(false))"},
     {"branch open calls", R"(local function a() return 1,nil,3 end local function b() return 4,5 end
         local function f(c) if c then return a() else return b() end end return f(true))"},
-    {"class", R"(class Point public x public y function magnitude(self) return self.x*self.x+self.y*self.y end end
-        local p=Point.new({x=3,y=4}) return p:magnitude(),p.x)"},
-    {"class capture", R"(local x=3 class Point public x
-        function make() return Point.new({x=x}) end end
-        x=7 local p=Point.make() return p.x)"},
-    {"class inheritance", R"(open class Animal public age function ageNext(self) return self.age+1 end end
-        class Cat extends Animal public breed end
-        local c=Cat.new({age=3,breed='cat'}) return c:ageNext(),c.breed)"},
     {"parenthesized statement", R"(local n=0 local function f() n+=1 end local function g() n+=4 end
         f(); (if n==1 then f else g)(); return n)"},
     {"for evaluation order", R"(local log='' local function f(x) log..=x return tonumber(x) end
@@ -274,10 +261,28 @@ const Case cases[] = {
         21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
         41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,f()}
         return t[1],t[16],t[17],t[32],t[33],t[50],t[60],t[61],t[62],t[63])"},
-    {"integer boundaries", "return 0x8000000000000000i, 9223372036854775807i, -27i, 0i"},
     {"precedence", R"(local function f(a,b,c)
         return a^b^c,(a^b)^c,a-(b-c),a/(b/c),-(a^b),(-a)^b,a..(b..c),not(a==b)
         end return f(8,2,3))"},
+    {"interpolated strings", R"(local function f(a,b)
+        return `x{a}y{b}%`, `tick\`{a}\{b}\\`, `{a .. b}{#tostring(b)}`, `{"folded"}{a}`, #`{ {a} }` > 0
+        end return f(1,'two'))"},
+    {"interpolation as statement", R"(local n=0 local t=setmetatable({}, {__tostring=function() n+=1 return 'x' end})
+        local _ = `{t}` return n)"},
+    {"compound assignment", R"(local t={n=1,s='a'} local k='n' t.n+=2 t[k]*=3 t.s..='b'
+        G=(G or 0) G+=5 local x=7 x//=2 x^=2 x%=5 x-=0.5 x/=2 return t.n,t.s,x,G)"},
+    {"compound target evaluated twice", R"(local n=0 local inner={b=1}
+        local t=setmetatable({}, {__index=function(_, k) n+=1 return inner end})
+        t.a.b = t.a.b + 1 return inner.b, n)"},
+    {"compound upvalue order", R"(local x=1 local function f() x=10 return 2 end x=x+f() return x)"},
+    {"const bindings", R"(const a = 3 const function f(x) return x + a end local t = {a} return f(4), t[1])"},
+    {"native attribute", R"(@native local function f(x) return x*2 end
+        local g = @native function(y) return y+1 end return f(3), g(4))"},
+    {"native module", "--!native\nlocal function f(x) return x + 1 end return f(1)"},
+    {"nested guard", R"(local function f(a,b) local x=0
+        if a==1 then x+=1 if b then return x end end x+=10
+        if a==2 then x+=2 if b then return x end end return x end
+        return f(1,true),f(1,false),f(2,true),f(2,false),f(3,true))"},
 };
 
 void roundTrips()
@@ -407,14 +412,18 @@ void branchRecovery()
             for (int debug : {0, 2})
             {
                 Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
-                auto output = decompile(Luau::compile(source, options));
                 std::string context = std::string(test.name) + " (opt=" + std::to_string(optimization) +
                     ", debug=" + std::to_string(debug) + ")";
+                std::string output;
+                try { output = decompile(Luau::compile(source, options)); }
+                catch (const std::exception& error) { throw std::runtime_error(context + ": " + error.what()); }
                 check(evaluate(output) == expected, context + ": branch effects/results changed\n" + output);
                 // Returning the function prevents optimization level 2 from
                 // also inlining a legitimate second copy into the test driver.
                 auto bytecode = Luau::compile(definition, options);
-                auto structure = decompile(bytecode);
+                std::string structure;
+                try { structure = decompile(bytecode); }
+                catch (const std::exception& error) { throw std::runtime_error(context + " (definition): " + error.what()); }
                 auto cfg = buildCFG(lift(bytecode));
                 for (const char* marker : {"branch_body_marker", "alternative_marker", "shared_tail_marker"})
                 {
@@ -630,13 +639,77 @@ void inliningAndDebugNames()
 }
 }
 
+void modernSyntax()
+{
+    Luau::CompileOptions options; options.optimizationLevel = 1; options.debugLevel = 0;
+    auto decompiled = [&](const char* source) { return decompile(Luau::compile(source, options)); };
+    constexpr auto npos = std::string::npos;
+
+    auto interpolated = decompiled("local a, b = ... return `x{a}y{b}%`, `{a.name}`");
+    check(interpolated.find("`x{") != npos && interpolated.find("}y{") != npos && interpolated.find("}%`") != npos &&
+        interpolated.find(":format(") == npos, "interpolated strings should be recovered:\n" + interpolated);
+    auto escaped = decompiled(R"(local a = ... return `\`{a}\{\\`)");
+    check(escaped.find(R"(`\`{)") != npos && escaped.find(R"(}\{\\`)") != npos, "interpolated text must escape ` { \\:\n" + escaped);
+    auto format = decompiled(R"(local a = ... return ("%d"):format(a), ("plain"):format())");
+    check(format.find(R"(("%d"):format()") != npos && format.find(R"(("plain"):format())") != npos,
+        "only format calls an interpolated string compiles to are rewritten:\n" + format);
+    auto statement = decompiled("local a = ... local _ = `{a}`");
+    check(statement.find(":format(") != npos, "an interpolated string is not a statement:\n" + statement);
+    evaluate(statement);
+
+    auto compound = decompiled("local t, k = ... t.n += 1 t[k] ..= 'x' g = g + 2 t.a.b = t.a.b + 1");
+    check(compound.find(".n += 1") != npos && compound.find("] ..= \"x\"") != npos && compound.find("g += 2") != npos,
+        "compound assignments should be recovered:\n" + compound);
+    check(compound.find(".b +=") == npos, "a compound assignment would evaluate its table expression once:\n" + compound);
+
+    auto native = decompiled("--!native\n@native local function f(x) return x end local g = @native function() end return f, g");
+    size_t attributes = 0;
+    for (size_t at = native.find("@native "); at != npos; at = native.find("@native ", at + 1)) ++attributes;
+    check(native.rfind("--!native\n", 0) == 0 && native.find("@native local function") != npos && attributes == 2,
+        "native attributes and hot comments should be recovered:\n" + native);
+    check(decompiled("local function f() end return f").find("native") == npos, "functions are not native by default");
+}
+
+// These shapes used to take minutes (and nest every statement into the
+// previous `if`); they must stay fast and flat.
+void largeInputs()
+{
+    std::string big = "local function big(a, b, t)\n    local x = 0\n";
+    for (int i = 0; i < 400; ++i)
+    {
+        auto n = std::to_string(i), key = std::to_string(i % 13);
+        big += "    if a == " + n + " then x += " + n + " if b then return x end end\n";
+        big += "    t[" + key + "] = (t[" + key + "] or 0) + x\n";
+        big += "    do local c = function() return x + " + n + " end t.c = c end\n";
+    }
+    big += "    return x\nend\nreturn big(5, false, {}), big(7, true, {}), big(-1, true, {})";
+
+    std::string list = "local function f(n) return n * 2 end local t = {";
+    for (int i = 0; i < 3000; ++i) list += "f(" + std::to_string(i) + "), ";
+    list += "} return #t, t[1], t[3000]";
+
+    for (int optimization : {0, 1, 2})
+        for (int debug : {0, 2})
+        {
+            Luau::CompileOptions options; options.optimizationLevel = optimization; options.debugLevel = debug;
+            std::string context = " (opt=" + std::to_string(optimization) + ", debug=" + std::to_string(debug) + ")";
+            auto output = decompile(Luau::compile(big, options));
+            check(evaluate(output) == evaluate(big), "large function results differ" + context);
+            std::istringstream lines(output);
+            for (std::string line; std::getline(lines, line);)
+                if (auto indent = line.find_first_not_of(' '); indent != std::string::npos)
+                    check(indent <= 12, "large function should stay flat" + context + ": " + line);
+
+            output = decompile(Luau::compile(list, options));
+            check(evaluate(output) == evaluate(list), "large constructor results differ" + context);
+            check(output.find("local v") == std::string::npos, "constructor values should inline" + context);
+        }
+}
+
 int main(int argc, char** argv)
 {
     try
     {
-        FFlag::DebugLuauUserDefinedClasses.value = true;
-        FFlag::DebugLuauUserDefinedClassesRuntime.value = true;
-        FFlag::LuauIntegerType2.value = true;
         if (argc > 1)
         {
             for (const auto& test : cases) if (test.name == std::string_view(argv[1]))
@@ -655,6 +728,7 @@ int main(int argc, char** argv)
             return 0;
         }
         roundTrips(); branchRecovery(); stagesAndNames(); inliningAndDebugNames(); callbackInlining(); argumentAliases(); singleUseCallAndStoreValues();
+        modernSyntax(); largeInputs();
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

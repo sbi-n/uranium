@@ -52,7 +52,6 @@ void verify(const IRContext& ir)
                     }
                     if (auto ref = std::get_if<IRFunctionRef>(&operand)) check(ref->ref < ir.functions.size(), "dangling function reference");
                     if (auto ref = std::get_if<IRTableRef>(&operand)) check(ref->ref < function.tables.size(), "dangling table reference");
-                    if (auto ref = std::get_if<IRClassRef>(&operand)) check(ref->ref < function.classes.size(), "dangling class reference");
                 }
                 bool terminal = edges != 0 || insn.op == IROp::RETURN;
                 check(terminal == (i + 1 == block.instructions.size()), "misplaced or missing terminator");
@@ -184,20 +183,17 @@ void constants()
     auto main = builder.beginFunction(0);
     int string = builder.addConstantString({"a\0b", 3});
     int vector = builder.addConstantVectorf(1, 2, 3, 0);
-    int integer = builder.addConstantInteger(std::numeric_limits<int64_t>::min());
     builder.emitAD(LOP_LOADN, 0, -123);
     builder.emitABC(LOP_LOADKX, 1, 0, 0);
     builder.emitAux(string);
     builder.emitAD(LOP_LOADK, 2, vector);
-    builder.emitAD(LOP_LOADK, 3, integer);
-    builder.emitABC(LOP_RETURN, 0, 5, 0);
-    auto ir = lift(finish(builder, main, 4));
+    builder.emitABC(LOP_RETURN, 0, 4, 0);
+    auto ir = lift(finish(builder, main, 3));
     verify(ir);
     auto moves = instructions(ir, IROp::MOVE);
     check(std::get<IRConstantNumber>(moves[0]->operands[1]).value == -123, "LOADN lost its sign");
     check(std::get<IRConstantString>(moves[1]->operands[1]).value == std::string("a\0b", 3), "embedded NUL lost");
     check(std::get<IRConstantVector>(moves[2]->operands[1]).value[2] == 3, "vector lost a component");
-    check(std::get<IRConstantInteger>(moves[3]->operands[1]).value == std::numeric_limits<int64_t>::min(), "integer lost precision");
 
     Luau::BytecodeBuilder tables;
     main = tables.beginFunction(0);
@@ -269,27 +265,31 @@ void errors()
     rejects(Luau::compile("local ="), "Expected");
     rejects(std::string(1, char(255)), "version");
 
-    struct Patch : Luau::BytecodeEncoder
-    {
-        std::function<void(uint32_t*, size_t)> apply;
-        void encode(uint32_t* code, size_t count) override { apply(code, count); }
-    } patch;
-    auto patched = [&](std::function<void(uint32_t*, size_t)> mutate) {
-        patch.apply = std::move(mutate);
-        Luau::BytecodeBuilder builder(&patch);
+    // The builder validates what it emits (in assert-enabled builds), so the
+    // malformed words are patched into the serialized bytecode afterwards.
+    auto patched = [&](const std::function<void(uint32_t*, size_t)>& mutate) {
+        Luau::BytecodeBuilder builder;
         auto main = builder.beginFunction(0);
         int name = builder.addConstantString({"x", 1});
         builder.emitAD(LOP_JUMP, 0, 2);
         builder.emitABC(LOP_GETGLOBAL, 0, 0, 0);
         builder.emitAux(name);
         builder.emitABC(LOP_RETURN, 0, 1, 0);
-        return finish(builder, main, 1);
+        auto bytecode = finish(builder, main, 1);
+        uint32_t code[] = {LOP_JUMP | (2u << 16), LOP_GETGLOBAL, uint32_t(name), LOP_RETURN | (1u << 16)};
+        const std::string original(reinterpret_cast<const char*>(code), sizeof(code));
+        auto at = bytecode.find(original);
+        check(at != std::string::npos && bytecode.find(original, at + 1) == std::string::npos, "could not locate code to patch");
+        mutate(code, std::size(code));
+        bytecode.replace(at, sizeof(code), reinterpret_cast<const char*>(code), sizeof(code));
+        return bytecode;
     };
     rejects(patched([](auto code, auto) { code[0] = LOP_JUMP | (1u << 16); }), "AUX or CAPTURE");
     rejects(patched([](auto code, auto) { code[0] = LOP_JUMP | (0xfffeu << 16); }), "out of range");
     rejects(patched([](auto code, auto) { code[0] = 255; }), "unknown opcode");
     rejects(patched([](auto code, auto count) { code[count - 1] = LOP_LOADKX; }), "missing AUX");
     rejects(patched([](auto code, auto) { code[0] = LOP_CAPTURE; }), "standalone CAPTURE");
+    rejects(patched([](auto code, auto) { code[0] = LOP_NEWCLASS; }), "experimental class");
 }
 } // namespace
 

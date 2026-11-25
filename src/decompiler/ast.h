@@ -37,7 +37,7 @@ struct ASTExpression
 
 struct ASTStatement
 {
-    enum class Kind { ASSIGN, LOCAL, EXPRESSION, IF, WHILE, REPEAT, NUMERIC_FOR, GENERIC_FOR, RETURN, BREAK, CONTINUE, SETLIST, CLASS, METHOD };
+    enum class Kind { ASSIGN, LOCAL, EXPRESSION, IF, WHILE, REPEAT, NUMERIC_FOR, GENERIC_FOR, RETURN, BREAK, CONTINUE, SETLIST };
     explicit ASTStatement(Kind kind) : kind(kind) {}
     Kind kind;
     std::vector<ASTExpr> lhs;
@@ -46,10 +46,7 @@ struct ASTStatement
     std::vector<ASTSymbolId> names;
     std::vector<ASTStatement> body;
     std::vector<ASTStatement> alternative;
-    int64_t firstIndex = 1;
-    std::string text;
-    std::vector<std::string> fields;
-    bool open = false;
+    int64_t firstIndex = 1; // SETLIST: table index of the first value.
 };
 using ASTBlock = std::vector<ASTStatement>;
 
@@ -58,6 +55,7 @@ struct ASTFunction
     uint32_t id;
     std::vector<ASTSymbolId> parameters;
     bool isVararg;
+    bool native = false; // Printed with the @native attribute.
     ASTBlock body;
 };
 
@@ -65,6 +63,7 @@ struct ASTContext
 {
     std::vector<ASTSymbol> symbols;
     std::shared_ptr<ASTFunction> entry;
+    bool nativeModule = false; // Printed as the --!native hot comment.
 };
 
 ASTContext buildAST(const SSAContext& ssa);

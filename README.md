@@ -34,6 +34,17 @@ cmake --build build --target uranium ir_tests decompiler_tests -j 4
 ctest --test-dir build --output-on-failure
 ```
 
+Luau is fetched by CMake (`FetchContent`) from a pinned release tag, `URANIUM_LUAU_TAG` in
+`CMakeLists.txt` (currently `0.748`), and verified against `URANIUM_LUAU_SHA256`. To upgrade, change
+both:
+
+```bash
+curl -sL https://github.com/luau-lang/luau/archive/refs/tags/<tag>.tar.gz | shasum -a 256
+```
+
+To build against a local Luau checkout instead, configure with
+`-DFETCHCONTENT_SOURCE_DIR_LUAU=/path/to/luau`.
+
 ## IR
 
 The C++ lifter accepts bytecode from the bundled Luau compiler and returns an owning value:
@@ -46,8 +57,8 @@ IRContext ir = lift(Luau::compile("return 1 + input"));
 std::string text = dump(ir);
 ```
 
-Function `f0` is the entry point. Function references index `IRContext::functions`; block,
-table, and class references index the current function's vectors. PCs count bytecode words,
+Function `f0` is the entry point. Function references index `IRContext::functions`; block
+and table references index the current function's vectors. PCs count bytecode words,
 and block ranges are `[startpc, endpc)`. Every block ends with an explicit terminator.
 Load and arithmetic variants share IR operations; constants retain their Luau types.
 
@@ -66,17 +77,17 @@ Load and arithmetic variants share IR operations; constants retain their Luau ty
 | `JUMP`, `BRANCH` | target / condition, operand(s), taken target, fallthrough target |
 | `FORNPREP`, `FORNLOOP` | loop base register, taken target, fallthrough target |
 | `FORGPREP`, `FORGLOOP` | loop base, target / loop base, variable count, taken target, fallthrough target |
-| `NEWCLASS`, `NEWCLASSMEMBER` | destination, shape, superclass or nil, open flag / class, name, value |
 
 Register ranges use `count = -1` for the dynamic stack top and `0` for no values.
 Captures distinguish values, register references, and inherited upvalues. Table templates
-and class shapes are copied before the temporary VM closes. `IRImmediate` (`#` in dumps)
-represents metadata, including the VM function ID for `PROTO_MISMATCH`.
+are copied before the temporary VM closes. `IRImmediate` (`#` in dumps)
+represents metadata, including the VM function ID for `PROTO_MISMATCH`. `IRFunction::native`
+records the `@native` attribute and `IRContext::nativeModule` the `--!native` hot comment.
 
 Fast-call hints use their ordinary fallback instructions; their `CALL` retains
 `argumentsBeforeCallee` so expression reconstruction preserves the fallback lookup order.
-Coverage counters, NOPs, and vararg stack setup are omitted. Runtime-only instructions and invalid instruction boundaries
-raise `std::runtime_error`. Input must be compiler-produced bytecode: the Luau loader is
+Coverage counters, NOPs, and vararg stack setup are omitted. Runtime-only instructions, experimental
+class bytecode, and invalid instruction boundaries raise `std::runtime_error`. Input must be compiler-produced bytecode: the Luau loader is
 not a validator for arbitrary binary data.
 
 ## Decompiler
@@ -118,8 +129,18 @@ std::string source = printAST(ast);
   definitions/uses, including call result ranges and loop control registers.
 - AST: lexical declarations, expressions, conditions, `if`/`elseif`, `while`, `repeat`,
   numeric/generic `for`, `break`/`continue`, tables, methods, closures, and multiple returns.
-  Reference captures remain shared; value captures remain snapshots. Experimental class
-  instructions reconstruct class declarations and require the corresponding bundled Luau flags.
+  Reference captures remain shared; value captures remain snapshots.
+
+Output uses current Luau syntax where the bytecode determines it:
+
+- String interpolation: `` `{name} has {#items} items` `` for the `("%*..."):format(...)` call an
+  interpolated string compiles to.
+- Compound assignment: `x += 1`, `t.name ..= "!"`, `count //= 2`, when the target is a local, a
+  global, or a local table indexed by a constant or a local (so evaluating it once is unobservable).
+- `if … then … else` expressions, `//`, `continue`, and generalized iteration (`for k, v in t`).
+- `@native` on functions and the `--!native` hot comment.
+
+Experimental class syntax is not supported (its bytecode is rejected); Luau removed the integer type.
 
 Bindings use [Lua Expert v2](https://blog.lua.expert/posts/v2/)-style value-based names.
 String-key accesses use the property name (`hello` for both `t.hello` and `t["hello"]`).
@@ -135,9 +156,9 @@ independent, start at one for the output chunk, and follow printed declaration o
 including nested function bodies. Numeric loops use `i`, `j`, ... according to nesting.
 Repeated names become `hello2`, `hello3`, ...; names ending in a digit use an underscore
 (`hello2_2`). Global-name conflicts receive a leading underscore. Generated names skip
-reserved semantic names, globals, and classes. Names can be reused in separate lexical
+reserved semantic names and globals. Names can be reused in separate lexical
 scopes; captures and recursive references retain their binding's chosen name.
-Globals, property/method names, and runtime class names retain their semantic names.
+Globals and property/method names retain their semantic names.
 
 Single-use temporary values are substituted directly into arguments, table keys/values,
 returns, and other expressions when evaluation order can be preserved. Immutable aliases
@@ -158,10 +179,12 @@ For example:
 
 ```lua
 local n1 = 1
+
 local function add(p1)
-    n1 = n1 + p1
+    n1 += p1
     return n1
 end
+
 return add(2)
 ```
 
