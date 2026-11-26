@@ -29,7 +29,8 @@ struct SSAPhi
 {
     uint16_t reg;
     SSAValueId result;
-    std::vector<std::pair<uint32_t, SSAValueId>> inputs; // predecessor, value
+    // (Predecessor block, value). Block 0 also receives entryValues[reg] on function entry.
+    std::vector<std::pair<uint32_t, SSAValueId>> inputs;
 };
 
 struct SSABlock

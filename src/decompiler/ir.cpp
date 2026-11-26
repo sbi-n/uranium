@@ -167,20 +167,20 @@ struct FunctionLifter
             // Hash order depends on the VM; order entries by their key text so
             // that dumps and reconstructed constructors are deterministic.
             std::vector<std::pair<std::string, std::pair<IROperand, IROperand>>> entries;
+            auto append = [&](IROperand key, const TValue& item) {
+                auto text = operandText(key);
+                entries.emplace_back(std::move(text), std::pair{std::move(key), value(item)});
+            };
             for (int i = 0; i < table->sizearray; ++i)
                 if (!ttisnil(&table->array[i]))
-                {
-                    IROperand key = IRConstantNumber{double(i + 1)};
-                    entries.emplace_back(operandText(key), std::pair{std::move(key), value(table->array[i])});
-                }
+                    append(IRConstantNumber{double(i + 1)}, table->array[i]);
             for (int i = 0; i < sizenode(table); ++i)
             {
                 const LuaNode& node = table->node[i];
                 if (ttisnil(&node.val)) continue;
                 TValue keyValue;
                 getnodekey(state, &keyValue, &node);
-                IROperand key = value(keyValue);
-                entries.emplace_back(operandText(key), std::pair{std::move(key), value(node.val)});
+                append(value(keyValue), node.val);
             }
             std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
             IRTable result;

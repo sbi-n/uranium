@@ -31,9 +31,9 @@ ASTStatement assign(std::vector<ASTExpr> lhs, std::vector<ASTExpr> rhs)
 {
     ASTStatement s{SK::ASSIGN}; s.lhs = std::move(lhs); s.rhs = std::move(rhs); return s;
 }
-ASTExpr negate(ASTExpr e)
+ASTExpr negate(ASTExpr e, bool conditionOnly = true)
 {
-    if (e->kind == EK::UNARY && e->text == "not") return e->children[0];
+    if (conditionOnly && e->kind == EK::UNARY && e->text == "not") return e->children[0];
     if (e->kind == EK::LITERAL && e->text == "true") return literal("false");
     if (e->kind == EK::LITERAL && e->text == "false") return literal("true");
     if (e->kind == EK::BINARY && (e->text == "==" || e->text == "~="))
@@ -171,11 +171,14 @@ FunctionBuilder::FunctionBuilder(Builder& b, uint32_t proto, std::vector<ASTSymb
     }
     for (uint32_t block = 0; block < ssa.blocks.size(); ++block)
         for (const auto& phi : ssa.blocks[block].phis)
+        {
+            if (block == 0) groups.unite(phi.result, ssa.entryValues[phi.reg]);
             for (auto [pred, input] : phi.inputs)
             {
                 if (numericHeaders.count({block, phi.reg}) && ir.blocks[pred].instructions.back().op == IROp::FORNPREP) continue;
                 groups.unite(phi.result, input);
             }
+        }
     captureGroups();
     // Groups are final from here on; count definitions once for value captures.
     groupDefinitions.assign(ssa.values.size(), 0);
@@ -1231,6 +1234,8 @@ bool foldTables(ASTBlock& block, ASTContext& ast)
         for (auto& field : table->fields) track(field);
         for (size_t j = i + 1; j < block.size(); ++j)
         {
+            // Only the final list field can expand to multiple values.
+            if (!table->fields.empty() && !table->fields.back().key && table->fields.back().value->multret) break;
             auto& s = block[j];
             if (s.kind != SK::ASSIGN && s.kind != SK::SETLIST) break;
             bool writesTable = s.lhs.size() == 1 &&
@@ -1391,7 +1396,7 @@ bool optimizeBlock(ASTBlock& block, ASTContext& ast, const Usage& uses)
             {
                 auto no = s.alternative[0].rhs[0];
                 ASTExpr value;
-                if (yes->kind == EK::LITERAL && no->kind == EK::LITERAL && yes->text == "false" && no->text == "true") value = negate(s.condition);
+                if (yes->kind == EK::LITERAL && no->kind == EK::LITERAL && yes->text == "false" && no->text == "true") value = negate(s.condition, false);
                 else if (yes->kind == EK::LITERAL && no->kind == EK::LITERAL && yes->text == "true" && no->text == "false")
                     value = booleanExpr(s.condition) ? s.condition : expr(EK::UNARY, "not", {expr(EK::UNARY, "not", {s.condition})});
                 else if (yes->kind == EK::BINARY && yes->text == "or" && equalExpr(yes->children[1], no))
